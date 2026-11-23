@@ -4,7 +4,8 @@
 -- every downstream file in this pipeline (01_extract_stops.sql via INNER
 -- JOIN, 02_cohort/01_analysis_cohort.sql via FROM) depends on. This table
 -- was previously assumed to already exist; it is actually derived from
--- Houpu's residency-qualification table DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL,
+-- Houpu's residency-qualification table DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL
+-- (built by sql/00_residents_detection/residents_detection.sql),
 -- which computes several candidate "is this cuebiq_id a recurring Florida
 -- resident" rules side by side (IS_RESID_1_2, IS_RESID_1_3, IS_RESID_1_4,
 -- IS_RESID_1_5, IS_RESID_2_3). This pipeline uses the IS_RESID_1_5 = 1

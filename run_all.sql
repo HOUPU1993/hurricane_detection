@@ -1,9 +1,10 @@
 /*
 ===============================================================================
-HURRICANE IAN EVACUATION DETECTION — PARAMETERS
+HURRICANE IAN EVACUATION DETECTION — PARAMETERS (main_v6)
 ===============================================================================
 Edit this file when changing the main specification or running sensitivity tests.
-Run this file first in the same Snowflake session before running the SQL scripts.
+Run this file first in the same Snowflake session before running the SQL scripts
+(sql/00_residents_detection does not read it; see that folder's README).
 ===============================================================================
 */
 
@@ -19,118 +20,225 @@ SET EXCLUDE_UPLEVELLED = 0;
 -- -----------------------------------------------------------------------------
 -- Analysis windows
 -- -----------------------------------------------------------------------------
+-- Baseline: each user's normal mobility (reference for unfamiliarity).
 SET BASELINE_START = 20220902;
 SET BASELINE_END   = 20220922;
 
-SET EVAC_START = 20220923;
-SET EVAC_END   = 20220930;
+-- Departure phases. A departure is assigned to the phase in which its
+-- unfamiliar streak STARTS; the streak itself may cross phase boundaries.
+--   Phase 1 (pre-landfall):   PHASE1_START .. PHASE2_START - 1   (9/23-9/27)
+--   Phase 2 (landfall):       PHASE2_START .. PHASE3_START - 1   (9/28-9/30)
+--   Phase 3 (post-landfall):  PHASE3_START .. DEPARTURE_END      (10/1-10/7)
+-- PHASE2_START is Ian's landfall day; phase-1 departures must still be away
+-- on this day (see 05_persistence/02_departure.sql).
+SET PHASE1_START  = 20220923;
+SET PHASE2_START  = 20220928;
+SET PHASE3_START  = 20221001;
+SET DEPARTURE_END = 20221007;
 
-SET RETURN_START = 20221001;
-SET RETURN_END   = 20221023;
+-- End of observation: last day used for streaks, return detection and
+-- destination search.
+SET OBS_END = 20221023;
 
 -- -----------------------------------------------------------------------------
 -- Eligible user-day definition
 -- -----------------------------------------------------------------------------
-SET MIN_COVERED_STOP_MINUTES    = 120;
+SET MIN_COVERED_STOP_MINUTES     = 120;
 SET MIN_OBSERVATION_SPAN_MINUTES = 240;
-SET MAX_OVERLAPPING_ROWS        = 0;
+SET MAX_OVERLAPPING_ROWS         = 0;
 
 -- -----------------------------------------------------------------------------
 -- Analysis cohort
 -- -----------------------------------------------------------------------------
-SET MIN_BASELINE_ELIGIBLE_DAYS = 14;
-SET MIN_EVAC_ELIGIBLE_DAYS     = 3;
+SET MIN_BASELINE_ELIGIBLE_DAYS         = 14;  -- within BASELINE_START..BASELINE_END
+SET MIN_DEPARTURE_WINDOW_ELIGIBLE_DAYS = 3;   -- within PHASE1_START..DEPARTURE_END
 
 -- -----------------------------------------------------------------------------
 -- Spatial unfamiliarity
 -- -----------------------------------------------------------------------------
 SET K_NEIGHBORS = 3;
 
--- Main rule (implemented in 04_unfamiliarity/03_unfamiliar_days.sql):
--- event-day kNN score > maximum baseline leave-one-out kNN score
+-- Rule (04_unfamiliarity/03_unfamiliar_days.sql):
+-- day kNN score > maximum baseline leave-one-out kNN score
 
 -- -----------------------------------------------------------------------------
--- Persistence
+-- Departure and return
 -- -----------------------------------------------------------------------------
--- A candidate evacuee must have a run of consecutive unfamiliar days that
--- persists at least through PERSISTENCE_CHECK_END, not necessarily all the way
--- to EVAC_END (see 05_persistence/03_candidates.sql).
---
--- Set to 2 (was 3): Ian made landfall 9/28. A departure confirmed on two
--- consecutive days (e.g. 9/27-9/28, both weekdays, ruling out an ordinary
--- weekend trip) combined with no confirmed return before PERSISTENCE_CHECK_END
--- (9/29, one day after landfall) is treated as sufficient evidence of a real,
--- storm-related departure. See PARAMETER_LOG.md for the reasoning.
+-- Minimum confirmed unfamiliar days in a departure streak (all phases).
 SET MIN_CONSECUTIVE_UNFAMILIAR_DAYS = 2;
 
--- When building that run (05_persistence/01_unfamiliar_streaks.sql), a day with
--- no eligible_day data (missing/insufficient coverage, NOT a confirmed "at home"
--- day) is skipped rather than treated as a break, as long as no more than this
--- many consecutive days are missing. A confirmed familiar day (eligible_day=1
--- AND unfamiliar_day=0) always breaks the run, regardless of this setting.
-SET MAX_GAP_DAYS_TO_BRIDGE = 2;
-
--- The date used by 05_persistence/01_unfamiliar_streaks.sql to decide whether a
--- streak "reaches" far enough to count as unresolved (reaches_window_end): a
--- streak within MAX_GAP_DAYS_TO_BRIDGE of this date, with no confirmed return
--- home on or before it, counts -- even if the person is confirmed back home
--- later in the evac window (EVAC_END). Previously this check used EVAC_END
--- (9/30) itself, which incorrectly excluded people who evacuated through
--- landfall (9/28) and returned home as soon as it was safe (9/29-9/30) -- a
--- return could not have been caused by a storm that had already passed. Set to
--- one day after landfall to give a minimal buffer.
-SET PERSISTENCE_CHECK_END = 20220929;
-
--- Symmetric threshold for return detection (05_persistence/04_return_detection.sql):
--- how many consecutive confirmed-familiar days (same gap-bridging rule, mirrored)
--- are required before a candidate is considered to have returned home.
--- Lowered to 2 alongside MIN_CONSECUTIVE_UNFAMILIAR_DAYS for symmetry.
+-- Minimum confirmed familiar days in a return streak.
 SET MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN = 2;
 
+-- Up to this many consecutive missing/ineligible days are bridged inside a
+-- streak. A confirmed opposite-state day always breaks a streak.
+SET MAX_GAP_DAYS_TO_BRIDGE = 2;
+
 -- -----------------------------------------------------------------------------
--- Home and destination location (evacuation distance)
+-- Destination CBG
 -- -----------------------------------------------------------------------------
--- Nighttime window used to identify where someone sleeps (wraps past
--- midnight: hour >= NIGHT_START_HOUR OR hour < NIGHT_END_HOUR).
+-- Night window (wraps past midnight). Destination = the block group with the
+-- most night-window stop minutes between departure and return.
 SET NIGHT_START_HOUR = 21;
 SET NIGHT_END_HOUR   = 7;
 
--- Two nightly weighted-centers within this radius are treated as "the same
--- place". Used both to find each person's home (majority nightly cluster
--- across the baseline period, 05_persistence/02_home_location.sql) and their
--- evacuation destination (most recent qualifying nightly cluster during their
--- confirmed away period, 05_persistence/05_destination_location.sql). Not
--- fitted from data yet -- treat as a starting point pending a QC check of
--- night-to-night distances for people with no reason to have traveled.
-SET HOME_LOCATION_RADIUS_KM = 3;
 
--- Minimum nights at the same place (within HOME_LOCATION_RADIUS_KM) required
--- to count as a real destination rather than a one-night transit stop
--- (a highway hotel, for example).
-SET MIN_CONSECUTIVE_NIGHTS_AT_DESTINATION = 2;
+-- ===== sql/00_residents_detection/residents_detection.sql =====
+-- residents_detection
+-- Builds DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL: one row per device whose
+-- Cuebiq DEVICE_RECURRING_AREA home falls in a mandatory-evacuation-zone CBG
+-- (HURRICANE_IAN_MANDATORY_CBG_CROSS) on at least one baseline day, with
+-- daily home CBGs (21 columns), summary metrics, and five IS_RESID_* flags.
+-- Consumed by ../01_preprocessing/00_build_resident.sql (IS_RESID_1_5 = 1).
+--
+-- Does NOT read PARAMETERS.sql: the baseline window (20220902..20220922) and
+-- its length (21 days) are hard-coded below and must be kept in sync with
+-- BASELINE_START / BASELINE_END by hand.
+--
+-- QC queries (optional, commented out):
+--   (a) devices reported by more than one provider during baseline;
+--   (b) device-days with more than one distinct HOME block group.
 
--- -----------------------------------------------------------------------------
--- Candidate home-location gate (Florida bounding box)
--- -----------------------------------------------------------------------------
--- FL_RESIDENT (00_build_resident.sql) selects devices by Cuebiq's
--- DEVICE_RECURRING_AREA (IS_RESID_1_5), while FL_HOME_LOCATION
--- (02_home_location.sql) is this pipeline's own home estimate from baseline
--- nighttime stops. The two can disagree: a device can pass the residency
--- filter while its nighttime home is outside Florida. Without a check
--- downstream, such a device whose daytime mobility looked "unfamiliar"
--- during the evac window (e.g. a Boston resident on a pre-booked Hawaii
--- trip that overlapped Ian's landfall) gets flagged as a candidate evacuee
--- purely on unfamiliarity, with no connection to Florida at all. 03_candidates.sql requires a candidate's home to fall within this
--- rough bounding box. This is a rectangle, not the true state boundary --
--- it includes a sliver of Georgia/Alabama and clips part of the panhandle --
--- accepted as a reasonable first pass since it only affected ~0.9% of the
--- main_v4 candidate set (150 of 15,953: 148 with home outside the box, 2
--- with no home record at all). Revisit with a real Florida boundary
--- geometry (ST_WITHIN) if that ever becomes available in this project.
-SET FL_HOME_LAT_MIN = 24;
-SET FL_HOME_LAT_MAX = 31;
-SET FL_HOME_LNG_MIN = -88;
-SET FL_HOME_LNG_MAX = -79;
+-- SELECT CUEBIQ_ID, COUNT(DISTINCT PROVIDER_ID) AS N_PROVIDERS
+-- FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.DEVICE_RECURRING_AREA
+-- WHERE COUNTRY_CODE = 'US'
+--   AND SNAPSHOT_EVENT_DATE BETWEEN 20220902 AND 20220922
+-- GROUP BY CUEBIQ_ID
+-- HAVING COUNT(DISTINCT PROVIDER_ID) > 1;
+
+-- SELECT CUEBIQ_ID, SNAPSHOT_EVENT_DATE, COUNT(DISTINCT BLOCK_GROUP_ID) AS N_DISTINCT_CBG
+-- FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.DEVICE_RECURRING_AREA
+-- WHERE COUNTRY_CODE = 'US'
+--   AND TAG_TYPE_CODE = 'HOME'
+--   AND SNAPSHOT_EVENT_DATE BETWEEN 20220902 AND 20220922
+-- GROUP BY CUEBIQ_ID, SNAPSHOT_EVENT_DATE
+-- HAVING COUNT(DISTINCT BLOCK_GROUP_ID) > 1;
+
+-- STEP 0: CBG lookup -- convert 12-digit GEO10 (state 2, county 3, tract 6,
+-- block group 1) into Cuebiq's BLOCK_GROUP_ID format 'US.FL.ccc.tttttt.b'.
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.CBG_CUEBIQ_LOOKUP AS
+SELECT
+    GEO20,
+    GEO10,
+    'US.FL.' || SUBSTR(GEO10, 3, 3) || '.' || SUBSTR(GEO10, 6, 6) || '.' || SUBSTR(GEO10, 12, 1)
+        AS CUEBIQ_BLOCK_GROUP_ID
+FROM DEDICATED.HOUPU.HURRICANE_IAN_MANDATORY_CBG_CROSS;
+
+-- STEP 1: daily home detail. Keep HOME tags in target CBGs with
+-- CONFIDENCE_LEVEL > 0.5; if a device has several on the same day, keep the
+-- one with the highest CONFIDENCE_LEVEL (ties -> lowest GEO10).
+-- Note: the join to target CBGs happens BEFORE the daily ranking, so a
+-- lower-confidence target-CBG home still counts on a day when the device's
+-- top-confidence home is outside the target area.
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY AS
+WITH joined AS (
+    SELECT
+        d.CUEBIQ_ID,
+        l.GEO10,
+        TO_DATE(TO_VARCHAR(d.SNAPSHOT_EVENT_DATE), 'YYYYMMDD') AS SNAPSHOT_DATE,
+        d.CONFIDENCE_LEVEL,
+        d.PROVIDER_ID
+    FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.DEVICE_RECURRING_AREA d
+    JOIN DEDICATED.HOUPU.CBG_CUEBIQ_LOOKUP l
+        ON d.BLOCK_GROUP_ID = l.CUEBIQ_BLOCK_GROUP_ID
+    WHERE d.TAG_TYPE_CODE = 'HOME'
+      AND d.COUNTRY_CODE = 'US'
+      AND d.SNAPSHOT_EVENT_DATE BETWEEN 20220902 AND 20220922
+      AND d.CONFIDENCE_LEVEL > 0.5   -- confidence floor
+),
+ranked AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY CUEBIQ_ID, SNAPSHOT_DATE
+            ORDER BY CONFIDENCE_LEVEL DESC, GEO10 ASC
+        ) AS rn
+    FROM joined
+)
+SELECT CUEBIQ_ID, GEO10, SNAPSHOT_DATE
+FROM ranked
+WHERE rn = 1;
+
+-- STEP 2: per-device summary + five IS_RESID tiers (intermediate table, dropped below).
+-- DAYS_IN_TARGET_CBGS = days with a home in ANY target CBG; HOME_GEO10 = the
+-- CBG with the most days; IS_RESID_a_b = DAYS_IN_TARGET_CBGS >= CEIL(21 * a/b),
+-- i.e. 1_5 >= 5, 1_4 >= 6, 1_3 >= 7, 1_2 >= 11, 2_3 >= 14 days.
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_SUMMARY AS
+WITH total_days AS (
+    SELECT CUEBIQ_ID, COUNT(DISTINCT SNAPSHOT_DATE) AS DAYS_IN_TARGET_CBGS
+    FROM DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY
+    GROUP BY CUEBIQ_ID
+),
+device_geo10_days AS (
+    SELECT CUEBIQ_ID, GEO10, COUNT(DISTINCT SNAPSHOT_DATE) AS DAYS_AT_THIS_CBG
+    FROM DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY
+    GROUP BY CUEBIQ_ID, GEO10
+),
+home_ranked AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY CUEBIQ_ID
+            ORDER BY DAYS_AT_THIS_CBG DESC, GEO10 ASC
+        ) AS rn
+    FROM device_geo10_days
+),
+home AS (
+    SELECT CUEBIQ_ID, GEO10 AS HOME_GEO10, DAYS_AT_THIS_CBG AS DAYS_AT_HOME_CBG
+    FROM home_ranked WHERE rn = 1
+)
+SELECT
+    t.CUEBIQ_ID,
+    h.HOME_GEO10,
+    t.DAYS_IN_TARGET_CBGS,
+    h.DAYS_AT_HOME_CBG,
+    ROUND(h.DAYS_AT_HOME_CBG / t.DAYS_IN_TARGET_CBGS, 2) AS HOME_CONSISTENCY,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/5) THEN 1 ELSE 0 END AS IS_RESID_1_5,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/4) THEN 1 ELSE 0 END AS IS_RESID_1_4,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/3) THEN 1 ELSE 0 END AS IS_RESID_1_3,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/2) THEN 1 ELSE 0 END AS IS_RESID_1_2,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 2.0/3) THEN 1 ELSE 0 END AS IS_RESID_2_3
+FROM total_days t
+JOIN home h ON t.CUEBIQ_ID = h.CUEBIQ_ID;
+
+-- STEP 3: pivot daily home GEO10 into 21 date columns + attach STEP 2 summary -- final table
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL AS
+WITH pivoted AS (
+    SELECT *
+    FROM DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY
+    PIVOT (MAX(GEO10) FOR SNAPSHOT_DATE IN (
+        '2022-09-02','2022-09-03','2022-09-04','2022-09-05','2022-09-06',
+        '2022-09-07','2022-09-08','2022-09-09','2022-09-10','2022-09-11',
+        '2022-09-12','2022-09-13','2022-09-14','2022-09-15','2022-09-16',
+        '2022-09-17','2022-09-18','2022-09-19','2022-09-20','2022-09-21',
+        '2022-09-22'
+    )) AS p (
+        CUEBIQ_ID,
+        "2022-09-02","2022-09-03","2022-09-04","2022-09-05","2022-09-06",
+        "2022-09-07","2022-09-08","2022-09-09","2022-09-10","2022-09-11",
+        "2022-09-12","2022-09-13","2022-09-14","2022-09-15","2022-09-16",
+        "2022-09-17","2022-09-18","2022-09-19","2022-09-20","2022-09-21",
+        "2022-09-22"
+    )
+)
+SELECT
+    p.*,
+    s.HOME_GEO10,
+    s.DAYS_IN_TARGET_CBGS,
+    s.DAYS_AT_HOME_CBG,
+    s.HOME_CONSISTENCY,
+    s.IS_RESID_1_5,
+    s.IS_RESID_1_4,
+    s.IS_RESID_1_3,
+    s.IS_RESID_1_2,
+    s.IS_RESID_2_3
+FROM pivoted p
+JOIN DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_SUMMARY s
+    ON p.CUEBIQ_ID = s.CUEBIQ_ID;
+
+-- CLEANUP: keep only FL_RECURRING_RESIDENTS_FULL; drop intermediate tables
+DROP TABLE IF EXISTS DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY;
+DROP TABLE IF EXISTS DEDICATED.HOUPU.CBG_CUEBIQ_LOOKUP;
+DROP TABLE IF EXISTS DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_SUMMARY;
+
 
 
 -- ===== sql/01_preprocessing/00_build_resident.sql =====
@@ -140,7 +248,8 @@ SET FL_HOME_LNG_MAX = -79;
 -- every downstream file in this pipeline (01_extract_stops.sql via INNER
 -- JOIN, 02_cohort/01_analysis_cohort.sql via FROM) depends on. This table
 -- was previously assumed to already exist; it is actually derived from
--- Houpu's residency-qualification table DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL,
+-- Houpu's residency-qualification table DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL
+-- (built by sql/00_residents_detection/residents_detection.sql),
 -- which computes several candidate "is this cuebiq_id a recurring Florida
 -- resident" rules side by side (IS_RESID_1_2, IS_RESID_1_3, IS_RESID_1_4,
 -- IS_RESID_1_5, IS_RESID_2_3). This pipeline uses the IS_RESID_1_5 = 1
@@ -220,7 +329,7 @@ FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.STOP_BY_EVENT_DATE_UPLEVELLED AS s
 INNER JOIN DEDICATED.HOUPU.FL_RESIDENT AS r
     ON s.cuebiq_id = r.cuebiq_id
 
-WHERE s.event_date BETWEEN $BASELINE_START AND $RETURN_END
+WHERE s.event_date BETWEEN $BASELINE_START AND $OBS_END
   AND s.provider_id IN ($PROVIDER_1, $PROVIDER_2)
   AND (
         $EXCLUDE_UPLEVELLED = 0
@@ -835,14 +944,15 @@ SELECT
     ) AS n_baseline_eligible_days,
 
     COUNT_IF(
-        d.event_date BETWEEN $EVAC_START AND $EVAC_END
+        d.event_date BETWEEN $PHASE1_START AND $DEPARTURE_END
         AND d.eligible_day = 1
-    ) AS n_evacuation_eligible_days,
+    ) AS n_departure_window_eligible_days,
 
     COUNT_IF(
-        d.event_date BETWEEN $RETURN_START AND $RETURN_END
+        d.event_date > $DEPARTURE_END
+        AND d.event_date <= $OBS_END
         AND d.eligible_day = 1
-    ) AS n_return_eligible_days,
+    ) AS n_post_window_eligible_days,
 
     COUNT_IF(d.conflict_day = 1) AS n_conflict_days
 
@@ -867,7 +977,7 @@ AS
 SELECT *
 FROM DEDICATED.HOUPU.FL_ALLDAY_COHORT_COUNTS
 WHERE n_baseline_eligible_days >= $MIN_BASELINE_ELIGIBLE_DAYS
-  AND n_evacuation_eligible_days >= $MIN_EVAC_ELIGIBLE_DAYS;
+  AND n_departure_window_eligible_days >= $MIN_DEPARTURE_WINDOW_ELIGIBLE_DAYS;
 
 
 -- ===== sql/03_daily_center/01_daily_weighted_center.sql =====
@@ -966,15 +1076,11 @@ FROM daily_centers;
 -- ===== sql/04_unfamiliarity/01_evac_knn.sql =====
 -- Run ../../PARAMETERS.sql first in the same Snowflake session.
 --
--- Table name is kept as FL_EVAC_KNN for backward compatibility (03_unfamiliar_days.sql
--- joins to it by name), but as of this version it covers every day
--- from EVAC_START through RETURN_END, not just the evacuation window. EVAC_END and
--- RETURN_START are back-to-back (2022-09-30 -> 2022-10-01), so this is one
--- contiguous range. The extra RETURN-window rows let 03_unfamiliar_days.sql produce
--- an unfamiliar_day flag for every day after departure too, which
--- 05_persistence/04_return_detection.sql uses to detect when a candidate returned
--- home (the same personal baseline is used as the comparison set throughout, since
--- "baseline" below is unchanged).
+-- Scores every day from PHASE1_START through OBS_END (9/23-10/23) against the
+-- user's baseline daily centers. Covering the whole post-baseline range lets
+-- 05_persistence build departure streaks (which may run past DEPARTURE_END)
+-- and detect returns up to OBS_END. The table name FL_EVAC_KNN is kept for
+-- continuity; 03_unfamiliar_days.sql joins to it by name.
 
 CREATE OR REPLACE TRANSIENT TABLE
 DEDICATED.HOUPU.FL_EVAC_KNN
@@ -1001,7 +1107,7 @@ target_days AS (
         center_geog
 
     FROM DEDICATED.HOUPU.FL_ALLDAY_DAILY_CENTER
-    WHERE event_date BETWEEN $EVAC_START AND $RETURN_END
+    WHERE event_date BETWEEN $PHASE1_START AND $OBS_END
 ),
 
 pairwise AS (
@@ -1175,55 +1281,32 @@ SELECT
 FROM rank_summary;
 
 
--- ===== sql/05_persistence/01_unfamiliar_streaks.sql =====
+-- ===== sql/05_persistence/01_daily_states.sql =====
 -- Run ../../PARAMETERS.sql first in the same Snowflake session.
 --
--- Finds, per user, consecutive-day runs of unfamiliar_day = 1 within the
--- evacuation window (EVAC_START..EVAC_END). Rewritten to distinguish three
--- daily states instead of only looking at rows where unfamiliar_day = 1:
+-- One row per cohort user per calendar day from PHASE1_START through OBS_END.
+-- Used by both departure (02) and return (03) detection.
 --
---   state 1 (unfamiliar)  -- FL_EVAC_KNN_RARITY row with unfamiliar_day = 1
---   state 2 (familiar)    -- FL_EVAC_KNN_RARITY row with unfamiliar_day = 0
---                            (this day was actually observed and the person
---                            looked "normal" -- real evidence of being home)
---   state 3 (missing)     -- no FL_EVAC_KNN_RARITY row at all (not enough
---                            data to judge eligible_day that day -- we simply
---                            don't know what happened)
+--   day_state 1 = unfamiliar  (FL_EVAC_KNN_RARITY row, unfamiliar_day = 1)
+--   day_state 2 = familiar    (FL_EVAC_KNN_RARITY row, unfamiliar_day = 0)
+--   day_state 3 = missing     (no row: day not eligible / not scored)
 --
--- A state-2 day always breaks a run, no matter how short the gap is -- it is
--- confirmed evidence the person was back home. A state-3 (missing) day does
--- NOT break a run by itself, as long as no more than $MAX_GAP_DAYS_TO_BRIDGE
--- consecutive days are missing; longer blackouts are treated as a break too,
--- because we have no real evidence the person was still away. This means the
--- previous version's approach (grouping only the rows where unfamiliar_day=1,
--- using ROW_NUMBER()-based date adjacency) is replaced with a full per-day
--- calendar spine so missing days can be told apart from confirmed-familiar
--- days.
---
--- Output also flags whether each run's last unfamiliar day reaches at least
--- to $PERSISTENCE_CHECK_END (one day after Ian's 9/28 landfall) within the
--- same gap tolerance (reaches_window_end) -- 03_candidates.sql uses this to
--- decide the "true" departure: only a run that is still ongoing (or unbroken
--- by missing data) as of that date counts. This is deliberately NOT EVAC_END
--- itself: a person who evacuated through landfall and returned home once it
--- was safe (e.g. 9/29-9/30) cannot have been driven back by a storm that had
--- already passed, so requiring them to still be away on 9/30 would wrongly
--- exclude a real evacuation. A person who returned before landfall (e.g. left
--- 9/24, home by 9/27) is still correctly excluded either way.
+--   phase 1 = PHASE1_START .. PHASE2_START - 1   (pre-landfall)
+--   phase 2 = PHASE2_START .. PHASE3_START - 1   (landfall)
+--   phase 3 = PHASE3_START .. DEPARTURE_END      (post-landfall)
+--   phase 4 = after DEPARTURE_END                (return-only days)
 
--- GENERATOR(ROWCOUNT => ...) requires a literal constant, not a computed
--- expression -- precompute the calendar day count into a session variable
--- here so it can be passed in below.
-SET N_EVAC_CALENDAR_DAYS = (
+-- GENERATOR(ROWCOUNT => ...) requires a constant, so precompute the day count.
+SET N_STATE_DAYS = (
     SELECT DATEDIFF(
         DAY,
-        TO_DATE(TO_VARCHAR($EVAC_START), 'YYYYMMDD'),
-        TO_DATE(TO_VARCHAR($EVAC_END), 'YYYYMMDD')
+        TO_DATE(TO_VARCHAR($PHASE1_START), 'YYYYMMDD'),
+        TO_DATE(TO_VARCHAR($OBS_END), 'YYYYMMDD')
     ) + 1
 );
 
 CREATE OR REPLACE TRANSIENT TABLE
-DEDICATED.HOUPU.FL_EVAC_FLAG_STREAKS
+DEDICATED.HOUPU.FL_DAILY_STATE
 AS
 
 WITH cohort_users AS (
@@ -1237,47 +1320,62 @@ calendar AS (
     SELECT
         DATEADD(
             DAY, SEQ4(),
-            TO_DATE(TO_VARCHAR($EVAC_START), 'YYYYMMDD')
+            TO_DATE(TO_VARCHAR($PHASE1_START), 'YYYYMMDD')
         ) AS event_dt
 
-    FROM TABLE(GENERATOR(ROWCOUNT => $N_EVAC_CALENDAR_DAYS))
-),
+    FROM TABLE(GENERATOR(ROWCOUNT => $N_STATE_DAYS))
+)
 
-spine AS (
+SELECT
+    u.cuebiq_id,
+    c.event_dt,
 
-    SELECT
-        u.cuebiq_id,
-        c.event_dt
+    CASE
+        WHEN r.unfamiliar_day = 1 THEN 1
+        WHEN r.unfamiliar_day = 0 THEN 2
+        ELSE 3
+    END AS day_state,
 
-    FROM cohort_users AS u
-    CROSS JOIN calendar AS c
-),
+    CASE
+        WHEN c.event_dt < TO_DATE(TO_VARCHAR($PHASE2_START), 'YYYYMMDD') THEN 1
+        WHEN c.event_dt < TO_DATE(TO_VARCHAR($PHASE3_START), 'YYYYMMDD') THEN 2
+        WHEN c.event_dt <= TO_DATE(TO_VARCHAR($DEPARTURE_END), 'YYYYMMDD') THEN 3
+        ELSE 4
+    END AS phase
 
-daily_status AS (
+FROM cohort_users AS u
 
-    SELECT
-        s.cuebiq_id,
-        s.event_dt,
-        r.evac_knn_score_km,
-        r.baseline_score_max,
-        r.score_to_baseline_median_ratio,
-        r.center_lat,
-        r.center_lng,
+CROSS JOIN calendar AS c
 
-        CASE
-            WHEN r.unfamiliar_day = 1 THEN 1  -- confirmed unfamiliar
-            WHEN r.unfamiliar_day = 0 THEN 2  -- confirmed familiar (real break)
-            ELSE 3                            -- missing / not eligible
-        END AS day_state
+LEFT JOIN DEDICATED.HOUPU.FL_EVAC_KNN_RARITY AS r
+    ON u.cuebiq_id = r.cuebiq_id
+   AND c.event_dt = TO_DATE(TO_VARCHAR(r.event_date), 'YYYYMMDD');
 
-    FROM spine AS s
 
-    LEFT JOIN DEDICATED.HOUPU.FL_EVAC_KNN_RARITY AS r
-        ON s.cuebiq_id = r.cuebiq_id
-       AND s.event_dt = TO_DATE(TO_VARCHAR(r.event_date), 'YYYYMMDD')
-),
+-- ===== sql/05_persistence/02_departure.sql =====
+-- Run ../../PARAMETERS.sql first in the same Snowflake session.
+--
+-- Departure detection. One row per evacuee (cohort users with no qualifying
+-- streak are not in this table).
+--
+-- 1. Build unfamiliar streaks over the full FL_DAILY_STATE range
+--    (PHASE1_START..OBS_END), so a streak can cross phase boundaries.
+--    A familiar day always breaks a streak; up to MAX_GAP_DAYS_TO_BRIDGE
+--    consecutive missing days are bridged.
+-- 2. A streak qualifies when:
+--      - it STARTS between PHASE1_START and DEPARTURE_END;
+--      - it has >= MIN_CONSECUTIVE_UNFAMILIAR_DAYS confirmed unfamiliar days;
+--      - phase 1 only: the person is still away on PHASE2_START (landfall),
+--        i.e. the streak ends within MAX_GAP_DAYS_TO_BRIDGE days of landfall
+--        (or later) and no familiar day falls between its end and landfall.
+-- 3. The earliest qualifying streak is the departure; its start date is
+--    departure_date and the phase of that date is departure_phase.
 
-with_last_familiar AS (
+CREATE OR REPLACE TRANSIENT TABLE
+DEDICATED.HOUPU.FL_EVAC_DEPARTURE
+AS
+
+WITH states AS (
 
     SELECT
         *,
@@ -1285,9 +1383,15 @@ with_last_familiar AS (
             PARTITION BY cuebiq_id
             ORDER BY event_dt
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ) AS last_confirmed_familiar_dt
+        ) AS last_familiar_dt,
 
-    FROM daily_status
+        MIN(CASE WHEN day_state = 2 THEN event_dt END) OVER (
+            PARTITION BY cuebiq_id
+            ORDER BY event_dt
+            ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        ) AS next_familiar_dt
+
+    FROM DEDICATED.HOUPU.FL_DAILY_STATE
 ),
 
 unfamiliar_only AS (
@@ -1298,33 +1402,26 @@ unfamiliar_only AS (
             PARTITION BY cuebiq_id ORDER BY event_dt
         ) AS prev_unfamiliar_dt
 
-    FROM with_last_familiar
+    FROM states
     WHERE day_state = 1
 ),
 
-flagged_with_breaks AS (
+flagged AS (
 
     SELECT
         *,
         CASE
             WHEN prev_unfamiliar_dt IS NULL THEN 1
-
-            -- a confirmed-familiar day occurred strictly between the previous
-            -- unfamiliar day and this one -> always a real break
-            WHEN last_confirmed_familiar_dt IS NOT NULL
-                 AND last_confirmed_familiar_dt > prev_unfamiliar_dt THEN 1
-
-            -- otherwise, only break if the missing-day gap exceeds tolerance
+            WHEN last_familiar_dt > prev_unfamiliar_dt THEN 1
             WHEN DATEDIFF(DAY, prev_unfamiliar_dt, event_dt) - 1
                  > $MAX_GAP_DAYS_TO_BRIDGE THEN 1
-
             ELSE 0
         END AS new_streak_flag
 
     FROM unfamiliar_only
 ),
 
-streak_grouped AS (
+grouped AS (
 
     SELECT
         *,
@@ -1334,479 +1431,118 @@ streak_grouped AS (
             ROWS UNBOUNDED PRECEDING
         ) AS streak_group
 
-    FROM flagged_with_breaks
+    FROM flagged
 ),
 
-streak_summary AS (
+streaks AS (
 
     SELECT
         cuebiq_id,
         streak_group,
         MIN(event_dt) AS streak_start,
         MAX(event_dt) AS streak_end,
-
-        -- number of CONFIRMED unfamiliar days in this run (does not count
-        -- bridged missing days) -- this is what the >= MIN_CONSECUTIVE_
-        -- UNFAMILIAR_DAYS check in 03_candidates.sql is measured against
         COUNT(*) AS streak_length,
+        DATEDIFF(DAY, MIN(event_dt), MAX(event_dt)) + 1 AS streak_calendar_span_days,
 
-        -- calendar span of the run including any bridged missing days;
-        -- kept separate from streak_length so the two notions of "length"
-        -- (confirmed evidence vs. calendar days covered) are never conflated
-        DATEDIFF(DAY, MIN(event_dt), MAX(event_dt)) + 1
-            AS streak_calendar_span_days,
+        -- No familiar day can fall inside a streak, so every row shares the
+        -- same next familiar day after the streak.
+        MAX(next_familiar_dt) AS next_familiar_dt
 
-        MIN(evac_knn_score_km) AS min_knn_score_km,
-        MEDIAN(evac_knn_score_km) AS median_knn_score_km,
-        MAX(evac_knn_score_km) AS max_knn_score_km,
-
-        MIN(baseline_score_max) AS baseline_score_max_km,
-        MEDIAN(score_to_baseline_median_ratio)
-            AS median_score_to_baseline_ratio
-
-    FROM streak_grouped
+    FROM grouped
     GROUP BY cuebiq_id, streak_group
 ),
 
-window_bound AS (
-
-    SELECT TO_DATE(TO_VARCHAR($PERSISTENCE_CHECK_END), 'YYYYMMDD') AS persistence_check_dt
-),
-
--- confirmed-familiar days anywhere in the evac window, used below to check
--- whether a run's apparent "reach to PERSISTENCE_CHECK_END" is actually
--- interrupted by a real (not just missing-data) return home
-confirmed_familiar_days AS (
-
-    SELECT cuebiq_id, event_dt
-    FROM daily_status
-    WHERE day_state = 2
-)
-
-SELECT
-    s.*,
-
-    CASE
-        WHEN DATEDIFF(DAY, s.streak_end, w.persistence_check_dt) <= $MAX_GAP_DAYS_TO_BRIDGE
-             AND NOT EXISTS (
-                 SELECT 1
-                 FROM confirmed_familiar_days AS f
-                 WHERE f.cuebiq_id = s.cuebiq_id
-                   AND f.event_dt > s.streak_end
-                   AND f.event_dt <= w.persistence_check_dt
-             )
-        THEN 1
-        ELSE 0
-    END AS reaches_window_end
-
-FROM streak_summary AS s
-CROSS JOIN window_bound AS w;
-
-
--- ===== sql/05_persistence/02_home_location.sql =====
--- Run ../../PARAMETERS.sql first in the same Snowflake session.
---
--- Determines each resident's "home" location as the nighttime
--- (NIGHT_START_HOUR..NIGHT_END_HOUR, wrapping past midnight) weighted center
--- of the MAJORITY cluster of baseline nights -- not a naive average of every
--- baseline night. Averaging every night would let a handful of out-of-town
--- nights during the 21-day baseline window (a weekend trip, a visit to
--- family in another county) pull the home point toward wherever the person
--- happened to travel, even though most nights were genuinely spent at home.
---
--- Algorithm:
---   1. Compute one nightly weighted center per (cuebiq_id, night), using the
---      same spherical weighted-average machinery as 03_daily_center, but
---      restricted to stops that fall in the nighttime window and to baseline
---      dates only.
---   2. Self-join nights (per user) and flag pairs within
---      $HOME_LOCATION_RADIUS_KM of each other as "the same place".
---   3. For each night, count how many OTHER nights are the same place -- a
---      proxy for how often that location recurs.
---   4. The night with the most same-place neighbors anchors the home
---      cluster (ties broken by earliest night, for reproducibility).
---   5. Home nights = the anchor night plus every other night within radius
---      of it.
---   6. Re-run the weighted average over the raw stop-level records from just
---      those home nights (not over the already-averaged nightly points) --
---      this keeps the dwell-time weighting faithful to the original
---      03_daily_center formula, just restricted to a cleaner input set.
---
--- A user with sparse or no nighttime coverage during baseline (n_home_nights
--- small, or absent from this table entirely) has a correspondingly
--- unreliable or missing home estimate -- worth a QC check once run on real
--- data.
---
--- Scope: reads FL_ALLDAY_STOPS_UNIONED directly, without a join to
--- FL_ALLDAY_COHORT, so a home is computed for every FL_RESIDENT device with
--- baseline nighttime stops, not only cohort members or candidates.
-
-CREATE OR REPLACE TRANSIENT TABLE
-DEDICATED.HOUPU.FL_HOME_LOCATION
-AS
-
-WITH night_stops AS (
+bounds AS (
 
     SELECT
-        s.cuebiq_id,
+        TO_DATE(TO_VARCHAR($PHASE1_START), 'YYYYMMDD')  AS phase1_dt,
+        TO_DATE(TO_VARCHAR($PHASE2_START), 'YYYYMMDD')  AS phase2_dt,
+        TO_DATE(TO_VARCHAR($PHASE3_START), 'YYYYMMDD')  AS phase3_dt,
+        TO_DATE(TO_VARCHAR($DEPARTURE_END), 'YYYYMMDD') AS departure_end_dt
+),
+
+classified AS (
+
+    SELECT
+        s.*,
+
         CASE
-            WHEN HOUR(s.segment_start) >= $NIGHT_START_HOUR
-                THEN TO_DATE(s.segment_start)
-            WHEN HOUR(s.segment_start) < $NIGHT_END_HOUR
-                THEN DATEADD(DAY, -1, TO_DATE(s.segment_start))
-            ELSE NULL
-        END AS night_date,
-        s.lat,
-        s.lng,
-        s.dwell_time_minutes_in_event_date
+            WHEN s.streak_start < b.phase2_dt THEN 1
+            WHEN s.streak_start < b.phase3_dt THEN 2
+            ELSE 3
+        END AS departure_phase,
 
-    FROM DEDICATED.HOUPU.FL_ALLDAY_STOPS_UNIONED AS s
-    WHERE s.event_date BETWEEN $BASELINE_START AND $BASELINE_END
+        CASE
+            WHEN DATEDIFF(DAY, s.streak_end, b.phase2_dt) <= $MAX_GAP_DAYS_TO_BRIDGE
+             AND (s.next_familiar_dt IS NULL OR s.next_familiar_dt > b.phase2_dt)
+            THEN 1
+            ELSE 0
+        END AS away_at_landfall
+
+    FROM streaks AS s
+    CROSS JOIN bounds AS b
+    WHERE s.streak_start BETWEEN b.phase1_dt AND b.departure_end_dt
+      AND s.streak_length >= $MIN_CONSECUTIVE_UNFAMILIAR_DAYS
 ),
 
-night_stops_filtered AS (
-
-    SELECT *
-    FROM night_stops
-    WHERE night_date IS NOT NULL
-),
-
-nightly_unit_vectors AS (
+qualifying AS (
 
     SELECT
         *,
-        COS(RADIANS(lat)) * COS(RADIANS(lng)) AS sphere_x,
-        COS(RADIANS(lat)) * SIN(RADIANS(lng)) AS sphere_y,
-        SIN(RADIANS(lat)) AS sphere_z
-
-    FROM night_stops_filtered
-),
-
-nightly_center AS (
-
-    SELECT
-        cuebiq_id,
-        night_date,
-
-        SUM(dwell_time_minutes_in_event_date * sphere_x)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_x,
-        SUM(dwell_time_minutes_in_event_date * sphere_y)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_y,
-        SUM(dwell_time_minutes_in_event_date * sphere_z)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_z
-
-    FROM nightly_unit_vectors
-    GROUP BY cuebiq_id, night_date
-),
-
-nightly_center_geog AS (
-
-    SELECT
-        cuebiq_id,
-        night_date,
-        DEGREES(ATAN2(mean_z, SQRT(mean_x * mean_x + mean_y * mean_y)))
-            AS night_lat,
-        DEGREES(ATAN2(mean_y, mean_x)) AS night_lng
-    FROM nightly_center
-),
-
-nightly_center_final AS (
-
-    SELECT
-        *,
-        ST_MAKEPOINT(night_lng, night_lat) AS night_geog
-    FROM nightly_center_geog
-),
-
-night_pairs AS (
-
-    SELECT
-        a.cuebiq_id,
-        a.night_date AS night_date_a,
-        b.night_date AS night_date_b,
-        ST_DISTANCE(a.night_geog, b.night_geog) / 1000.0 AS distance_km
-
-    FROM nightly_center_final AS a
-
-    INNER JOIN nightly_center_final AS b
-        ON a.cuebiq_id = b.cuebiq_id
-       AND a.night_date <> b.night_date
-),
-
-neighbor_counts AS (
-
-    SELECT
-        cuebiq_id,
-        night_date_a AS night_date,
-        COUNT_IF(distance_km <= $HOME_LOCATION_RADIUS_KM)
-            AS same_place_neighbor_count
-
-    FROM night_pairs
-    GROUP BY cuebiq_id, night_date_a
-),
-
-anchor_night AS (
-
-    SELECT
-        n.cuebiq_id,
-        n.night_date AS anchor_night_date,
         ROW_NUMBER() OVER (
-            PARTITION BY n.cuebiq_id
-            ORDER BY n.same_place_neighbor_count DESC, n.night_date ASC
-        ) AS anchor_rank
+            PARTITION BY cuebiq_id ORDER BY streak_start
+        ) AS departure_rank
 
-    -- a night that appears in nightly_center_final but never got a row in
-    -- neighbor_counts (zero matches) still needs to be a candidate anchor
-    FROM (
-        SELECT
-            c.cuebiq_id,
-            c.night_date,
-            COALESCE(nc.same_place_neighbor_count, 0)
-                AS same_place_neighbor_count
-        FROM nightly_center_final AS c
-        LEFT JOIN neighbor_counts AS nc
-            ON c.cuebiq_id = nc.cuebiq_id
-           AND c.night_date = nc.night_date
-    ) AS n
-),
-
-home_nights AS (
-
-    SELECT a.cuebiq_id, a.anchor_night_date AS night_date
-    FROM anchor_night AS a
-    WHERE a.anchor_rank = 1
-
-    UNION
-
-    SELECT p.cuebiq_id, p.night_date_b AS night_date
-    FROM night_pairs AS p
-    INNER JOIN anchor_night AS a
-        ON p.cuebiq_id = a.cuebiq_id
-       AND p.night_date_a = a.anchor_night_date
-    WHERE a.anchor_rank = 1
-      AND p.distance_km <= $HOME_LOCATION_RADIUS_KM
-),
-
-home_stops AS (
-
-    SELECT ns.*
-    FROM night_stops_filtered AS ns
-    INNER JOIN home_nights AS h
-        ON ns.cuebiq_id = h.cuebiq_id
-       AND ns.night_date = h.night_date
-),
-
-home_unit_vectors AS (
-
-    SELECT
-        *,
-        COS(RADIANS(lat)) * COS(RADIANS(lng)) AS sphere_x,
-        COS(RADIANS(lat)) * SIN(RADIANS(lng)) AS sphere_y,
-        SIN(RADIANS(lat)) AS sphere_z
-    FROM home_stops
-),
-
-home_weighted AS (
-
-    SELECT
-        cuebiq_id,
-
-        SUM(dwell_time_minutes_in_event_date * sphere_x)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_x,
-        SUM(dwell_time_minutes_in_event_date * sphere_y)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_y,
-        SUM(dwell_time_minutes_in_event_date * sphere_z)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_z,
-
-        COUNT(DISTINCT night_date) AS n_home_nights
-
-    FROM home_unit_vectors
-    GROUP BY cuebiq_id
-),
-
-home_center AS (
-
-    SELECT
-        cuebiq_id,
-        n_home_nights,
-        DEGREES(ATAN2(mean_z, SQRT(mean_x * mean_x + mean_y * mean_y)))
-            AS home_lat,
-        DEGREES(ATAN2(mean_y, mean_x)) AS home_lng
-    FROM home_weighted
+    FROM classified
+    WHERE departure_phase <> 1
+       OR away_at_landfall = 1
 )
 
 SELECT
     cuebiq_id,
-    n_home_nights,
-    home_lat,
-    home_lng,
-    ST_MAKEPOINT(home_lng, home_lat) AS home_geog
+    streak_start              AS departure_date,
+    departure_phase,
+    streak_end                AS departure_streak_end_date,
+    streak_length             AS departure_streak_length,
+    streak_calendar_span_days AS departure_streak_calendar_span_days
 
-FROM home_center;
+FROM qualifying
+WHERE departure_rank = 1;
 
 
--- ===== sql/05_persistence/03_candidates.sql =====
+-- ===== sql/05_persistence/03_return.sql =====
 -- Run ../../PARAMETERS.sql first in the same Snowflake session.
 --
--- A candidate evacuee is someone whose LAST unfamiliar streak (from
--- 01_unfamiliar_streaks.sql) reaches at least through $PERSISTENCE_CHECK_END
--- (reaches_window_end = 1, within the same $MAX_GAP_DAYS_TO_BRIDGE
--- tolerance used to build the streak) AND is at least
--- $MIN_CONSECUTIVE_UNFAMILIAR_DAYS long. This replaces the previous
--- "earliest qualifying streak" rule: a streak that ends and is followed by
--- a confirmed return home before $PERSISTENCE_CHECK_END no longer counts,
--- even if it was long enough on its own, because it wasn't necessarily
--- caused by the storm (e.g. someone who left on 9/24, came home on 9/27 and
--- stayed, before Ian made landfall on 9/28, should not be flagged). A
--- confirmed return AFTER $PERSISTENCE_CHECK_END (e.g. home by 9/30, once
--- the storm has already passed) does not disqualify the candidate -- see
--- 01_unfamiliar_streaks.sql's header for the reasoning.
+-- Return detection, same rule for all departure phases. Mirrors the
+-- departure streak logic with states swapped: familiar days build a streak,
+-- an unfamiliar day always breaks it, and up to MAX_GAP_DAYS_TO_BRIDGE
+-- consecutive missing days are bridged.
 --
--- Because at most one streak per user can reach $PERSISTENCE_CHECK_END, no
--- ranking is needed here -- the WHERE clause alone picks at most one row per
--- cuebiq_id (verified empirically: n_rows = n_users in FL_EVAC_CANDIDATES).
--- candidate_start_date is therefore the true departure date: the first day
--- of the run that persists, uninterrupted by a confirmed return, through
--- $PERSISTENCE_CHECK_END.
---
--- Home-location gate: also requires a confirmed home (FL_HOME_LOCATION,
--- 02_home_location.sql) within the rough Florida bounding box defined by
--- $FL_HOME_LAT_MIN/MAX and $FL_HOME_LNG_MIN/MAX (see PARAMETERS.sql).
--- FL_RESIDENT is defined from Cuebiq's DEVICE_RECURRING_AREA, while
--- FL_HOME_LOCATION is estimated independently from baseline nighttime
--- stops; the two can disagree, so without this join someone whose nighttime
--- home is nowhere near Florida but whose daytime mobility happened to look
--- unfamiliar during the evac window would still be flagged as a
--- candidate (found via spot-check: a Boston resident on a pre-booked Hawaii
--- trip that overlapped Ian's landfall). A candidate with no FL_HOME_LOCATION
--- row at all (sparse baseline nighttime coverage) is also excluded here,
--- since their home cannot be confirmed to be in Florida either.
+-- return_date = start of the first familiar streak that begins after
+-- departure_streak_end_date and has >= MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN
+-- confirmed familiar days, searched through OBS_END. Evacuees with no such
+-- streak have no row (not returned by OBS_END).
 
 CREATE OR REPLACE TRANSIENT TABLE
-DEDICATED.HOUPU.FL_EVAC_CANDIDATES
+DEDICATED.HOUPU.FL_EVAC_RETURN
 AS
 
-SELECT
-    s.cuebiq_id,
-    s.streak_start AS candidate_start_date,
-    s.streak_end AS candidate_streak_end_date,
-    s.streak_length AS candidate_streak_length,
-    s.streak_calendar_span_days AS candidate_streak_calendar_span_days,
-    s.min_knn_score_km,
-    s.median_knn_score_km,
-    s.max_knn_score_km,
-    s.baseline_score_max_km,
-    s.median_score_to_baseline_ratio
-
-FROM DEDICATED.HOUPU.FL_EVAC_FLAG_STREAKS AS s
-
-INNER JOIN DEDICATED.HOUPU.FL_HOME_LOCATION AS h
-    ON s.cuebiq_id = h.cuebiq_id
-   AND h.home_lat BETWEEN $FL_HOME_LAT_MIN AND $FL_HOME_LAT_MAX
-   AND h.home_lng BETWEEN $FL_HOME_LNG_MIN AND $FL_HOME_LNG_MAX
-
-WHERE s.reaches_window_end = 1
-  AND s.streak_length >= $MIN_CONSECUTIVE_UNFAMILIAR_DAYS;
-
-
--- ===== sql/05_persistence/04_return_detection.sql =====
--- Run ../../PARAMETERS.sql first in the same Snowflake session.
---
--- Mirrors 01_unfamiliar_streaks.sql's gap-tolerant island logic, but flipped:
--- for each confirmed candidate evacuee (FL_EVAC_CANDIDATES), looks for the
--- first persistent run of CONFIRMED FAMILIAR days (unfamiliar_day = 0) within
--- the return window (RETURN_START..RETURN_END). Same three-state model as
--- 01_unfamiliar_streaks.sql, with unfamiliar/familiar swapped:
---
---   state 1 (unfamiliar) -- now the HARD BREAK: they left again, so a
---                            familiar run in progress does not count as a
---                            real return
---   state 2 (familiar)   -- now the day being accumulated into a streak
---   state 3 (missing)    -- bridged up to $MAX_GAP_DAYS_TO_BRIDGE consecutive
---                            days, same as the departure side
---
--- Requires 04_unfamiliarity/01_evac_knn.sql to have been widened to cover
--- RETURN_START..RETURN_END (see that file's header) so FL_EVAC_KNN_RARITY
--- has an unfamiliar_day judgment for return-window days too.
---
--- Unlike departure detection, a return does not need to persist to the end
--- of any window -- we want the FIRST stable homecoming, so the earliest
--- qualifying run (>= $MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN long) is used.
-
--- GENERATOR(ROWCOUNT => ...) requires a literal constant, so the day count
--- is precomputed into a session variable first (same fix as
--- 01_unfamiliar_streaks.sql's calendar spine).
-SET N_RETURN_CALENDAR_DAYS = (
-    SELECT DATEDIFF(
-        DAY,
-        TO_DATE(TO_VARCHAR($RETURN_START), 'YYYYMMDD'),
-        TO_DATE(TO_VARCHAR($RETURN_END), 'YYYYMMDD')
-    ) + 1
-);
-
-CREATE OR REPLACE TRANSIENT TABLE
-DEDICATED.HOUPU.FL_EVAC_RETURN_DATES
-AS
-
-WITH candidates AS (
-
-    SELECT cuebiq_id, candidate_start_date
-    FROM DEDICATED.HOUPU.FL_EVAC_CANDIDATES
-),
-
-calendar AS (
+WITH states AS (
 
     SELECT
-        DATEADD(
-            DAY, SEQ4(),
-            TO_DATE(TO_VARCHAR($RETURN_START), 'YYYYMMDD')
-        ) AS event_dt
-
-    FROM TABLE(GENERATOR(ROWCOUNT => $N_RETURN_CALENDAR_DAYS))
-),
-
-spine AS (
-
-    SELECT
-        c.cuebiq_id,
-        c.candidate_start_date,
-        cal.event_dt
-
-    FROM candidates AS c
-    CROSS JOIN calendar AS cal
-),
-
-daily_status AS (
-
-    SELECT
-        s.cuebiq_id,
-        s.candidate_start_date,
-        s.event_dt,
-
-        CASE
-            WHEN r.unfamiliar_day = 0 THEN 2  -- confirmed familiar (return evidence)
-            WHEN r.unfamiliar_day = 1 THEN 1  -- confirmed unfamiliar (left again -- hard break)
-            ELSE 3                            -- missing / not eligible
-        END AS day_state
-
-    FROM spine AS s
-
-    LEFT JOIN DEDICATED.HOUPU.FL_EVAC_KNN_RARITY AS r
-        ON s.cuebiq_id = r.cuebiq_id
-       AND s.event_dt = TO_DATE(TO_VARCHAR(r.event_date), 'YYYYMMDD')
-),
-
-with_last_unfamiliar AS (
-
-    SELECT
-        *,
-        MAX(CASE WHEN day_state = 1 THEN event_dt END) OVER (
-            PARTITION BY cuebiq_id
-            ORDER BY event_dt
+        s.*,
+        d.departure_date,
+        d.departure_streak_end_date,
+        MAX(CASE WHEN s.day_state = 1 THEN s.event_dt END) OVER (
+            PARTITION BY s.cuebiq_id
+            ORDER BY s.event_dt
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ) AS last_confirmed_unfamiliar_dt
+        ) AS last_unfamiliar_dt
 
-    FROM daily_status
+    FROM DEDICATED.HOUPU.FL_DAILY_STATE AS s
+
+    INNER JOIN DEDICATED.HOUPU.FL_EVAC_DEPARTURE AS d
+        ON s.cuebiq_id = d.cuebiq_id
 ),
 
 familiar_only AS (
@@ -1817,33 +1553,26 @@ familiar_only AS (
             PARTITION BY cuebiq_id ORDER BY event_dt
         ) AS prev_familiar_dt
 
-    FROM with_last_unfamiliar
+    FROM states
     WHERE day_state = 2
 ),
 
-flagged_with_breaks AS (
+flagged AS (
 
     SELECT
         *,
         CASE
             WHEN prev_familiar_dt IS NULL THEN 1
-
-            -- a confirmed-unfamiliar day (they left again) occurred strictly
-            -- between the previous familiar day and this one -> hard break
-            WHEN last_confirmed_unfamiliar_dt IS NOT NULL
-                 AND last_confirmed_unfamiliar_dt > prev_familiar_dt THEN 1
-
-            -- otherwise, only break if the missing-day gap exceeds tolerance
+            WHEN last_unfamiliar_dt > prev_familiar_dt THEN 1
             WHEN DATEDIFF(DAY, prev_familiar_dt, event_dt) - 1
                  > $MAX_GAP_DAYS_TO_BRIDGE THEN 1
-
             ELSE 0
         END AS new_streak_flag
 
     FROM familiar_only
 ),
 
-streak_grouped AS (
+grouped AS (
 
     SELECT
         *,
@@ -1853,370 +1582,265 @@ streak_grouped AS (
             ROWS UNBOUNDED PRECEDING
         ) AS streak_group
 
-    FROM flagged_with_breaks
+    FROM flagged
 ),
 
-streak_summary AS (
+streaks AS (
 
     SELECT
         cuebiq_id,
-        MAX(candidate_start_date) AS candidate_start_date,
         streak_group,
+        MAX(departure_date) AS departure_date,
+        MAX(departure_streak_end_date) AS departure_streak_end_date,
         MIN(event_dt) AS streak_start,
         MAX(event_dt) AS streak_end,
-        COUNT(*) AS streak_length,
-        DATEDIFF(DAY, MIN(event_dt), MAX(event_dt)) + 1
-            AS streak_calendar_span_days
+        COUNT(*) AS streak_length
 
-    FROM streak_grouped
+    FROM grouped
     GROUP BY cuebiq_id, streak_group
 ),
 
-qualifying_streaks AS (
+qualifying AS (
 
     SELECT
         *,
         ROW_NUMBER() OVER (
             PARTITION BY cuebiq_id ORDER BY streak_start
-        ) AS qualifying_streak_rank
+        ) AS return_rank
 
-    FROM streak_summary
-    WHERE streak_length >= $MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN
+    FROM streaks
+    WHERE streak_start > departure_streak_end_date
+      AND streak_length >= $MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN
 )
 
 SELECT
     cuebiq_id,
-    candidate_start_date,
-    streak_start AS return_date,
-    streak_end AS return_streak_confirmed_through_date,
+    streak_start  AS return_date,
+    streak_end    AS return_streak_confirmed_through_date,
     streak_length AS return_streak_length,
-    streak_calendar_span_days AS return_streak_calendar_span_days
+    DATEDIFF(DAY, departure_date, streak_start) AS days_away
 
-FROM qualifying_streaks
-WHERE qualifying_streak_rank = 1;
+FROM qualifying
+WHERE return_rank = 1;
 
 
--- ===== sql/05_persistence/05_destination_location.sql =====
+-- ===== sql/05_persistence/04_destination_cbg.sql =====
 -- Run ../../PARAMETERS.sql first in the same Snowflake session.
 --
--- Determines each candidate evacuee's "destination" -- the place they
--- actually settled during their evacuation, as opposed to any single day's
--- noisy full-day activity center (a highway rest stop spread across a whole
--- day of driving, for example). Uses the same nighttime
--- (NIGHT_START_HOUR..NIGHT_END_HOUR) weighted-center + radius-clustering
--- machinery as 02_home_location.sql ($HOME_LOCATION_RADIUS_KM), applied to
--- the nights the candidate is confirmed to have been away: from
--- candidate_start_date through the night before their confirmed return date
--- (FL_EVAC_RETURN_DATES), or through RETURN_END if no return was detected in
--- the observed data.
+-- Destination CBG for each evacuee: the block group with the most
+-- night-window stop minutes during the away period.
 --
--- Unlike home detection (which anchors on the MOST FREQUENT nightly
--- cluster), destination detection anchors on the MOST RECENT cluster that
--- reaches $MIN_CONSECUTIVE_NIGHTS_AT_DESTINATION nights -- the last place
--- they stayed for a real stretch of time, ignoring one-off transit nights
--- (a single hotel night on the way, say) that don't meet that threshold.
+-- Away period (by night): departure_date .. return_date - 1, or .. OBS_END
+-- when no return was detected. Night d covers NIGHT_START_HOUR on day d to
+-- NIGHT_END_HOUR on day d + 1.
 --
--- Note on gap tolerance: this clustering is purely distance-based -- any two
--- nights within $HOME_LOCATION_RADIUS_KM of each other are treated as the
--- same place, regardless of how many days apart they are. A missing night in
--- between two same-place nights does not break the match the way it would
--- break a date-adjacency chain (unlike 01_unfamiliar_streaks.sql /
--- 04_return_detection.sql), so $MAX_GAP_DAYS_TO_BRIDGE is NOT used here --
--- it would not mean the same thing in a radius-based match. The tradeoff:
--- if a candidate coincidentally revisited a nearby-but-unrelated location
--- twice with a long gap during their away period, this would (incorrectly)
--- merge the two visits into one cluster. Given the search window is bounded
--- to one candidate's own trip (at most a few weeks), this is judged an
--- acceptable approximation for now -- flag for QC if real data suggests
--- otherwise.
+-- Reads FL_ALLDAY_STOPS_UNIONED (overlap-resolved stops), so overlapping
+-- records are not double-counted. Each stop interval (which lies within one
+-- event_date) is clipped to the night window in minutes:
+--   morning part [00:00, NIGHT_END_HOUR)   -> night of event_date - 1
+--   evening part [NIGHT_START_HOUR, 24:00) -> night of event_date
+--
+-- Cuebiq block_group_id ('US.<ST>.<county3>.<tract6>.<bg1>') is converted to
+-- a 12-digit GEO10 via a state-abbreviation -> FIPS lookup; IDs that do not
+-- match that format get destination_cbg = NULL (raw ID is kept).
 
 CREATE OR REPLACE TRANSIENT TABLE
-DEDICATED.HOUPU.FL_EVAC_DESTINATION
+DEDICATED.HOUPU.FL_EVAC_DESTINATION_CBG
 AS
 
-WITH candidate_windows AS (
+WITH windows AS (
 
     SELECT
-        c.cuebiq_id,
-        c.candidate_start_date,
+        d.cuebiq_id,
+        d.departure_date AS first_night,
         COALESCE(
             DATEADD(DAY, -1, r.return_date),
-            TO_DATE(TO_VARCHAR($RETURN_END), 'YYYYMMDD')
-        ) AS search_end_date
+            TO_DATE(TO_VARCHAR($OBS_END), 'YYYYMMDD')
+        ) AS last_night
 
-    FROM DEDICATED.HOUPU.FL_EVAC_CANDIDATES AS c
+    FROM DEDICATED.HOUPU.FL_EVAC_DEPARTURE AS d
 
-    LEFT JOIN DEDICATED.HOUPU.FL_EVAC_RETURN_DATES AS r
-        ON c.cuebiq_id = r.cuebiq_id
+    LEFT JOIN DEDICATED.HOUPU.FL_EVAC_RETURN AS r
+        ON d.cuebiq_id = r.cuebiq_id
 ),
 
-night_stops AS (
+stops AS (
 
     SELECT
         s.cuebiq_id,
-        CASE
-            WHEN HOUR(s.segment_start) >= $NIGHT_START_HOUR
-                THEN TO_DATE(s.segment_start)
-            WHEN HOUR(s.segment_start) < $NIGHT_END_HOUR
-                THEN DATEADD(DAY, -1, TO_DATE(s.segment_start))
-            ELSE NULL
-        END AS night_date,
-        s.lat,
-        s.lng,
-        s.dwell_time_minutes_in_event_date
+        w.first_night,
+        w.last_night,
+        s.block_group_id,
+        TO_DATE(TO_VARCHAR(s.event_date), 'YYYYMMDD') AS event_dt,
+        HOUR(s.segment_start) * 60
+            + MINUTE(s.segment_start)
+            + SECOND(s.segment_start) / 60.0 AS start_min,
+        HOUR(s.segment_start) * 60
+            + MINUTE(s.segment_start)
+            + SECOND(s.segment_start) / 60.0
+            + s.dwell_time_minutes_in_event_date AS end_min
 
     FROM DEDICATED.HOUPU.FL_ALLDAY_STOPS_UNIONED AS s
 
-    INNER JOIN candidate_windows AS w
+    INNER JOIN windows AS w
         ON s.cuebiq_id = w.cuebiq_id
-       AND s.event_date BETWEEN
-             TO_NUMBER(TO_VARCHAR(w.candidate_start_date, 'YYYYMMDD'))
-             AND TO_NUMBER(TO_VARCHAR(w.search_end_date, 'YYYYMMDD'))
+       AND TO_DATE(TO_VARCHAR(s.event_date), 'YYYYMMDD')
+           BETWEEN w.first_night AND DATEADD(DAY, 1, w.last_night)
+
+    WHERE s.block_group_id IS NOT NULL
 ),
 
-night_stops_filtered AS (
+night_parts AS (
+
+    SELECT
+        cuebiq_id, first_night, last_night, block_group_id,
+        DATEADD(DAY, -1, event_dt) AS night_date,
+        GREATEST(0, LEAST(end_min, $NIGHT_END_HOUR * 60) - start_min) AS night_minutes
+    FROM stops
+
+    UNION ALL
+
+    SELECT
+        cuebiq_id, first_night, last_night, block_group_id,
+        event_dt AS night_date,
+        GREATEST(0, LEAST(end_min, 1440) - GREATEST(start_min, $NIGHT_START_HOUR * 60)) AS night_minutes
+    FROM stops
+),
+
+away_nights AS (
 
     SELECT *
-    FROM night_stops
-    WHERE night_date IS NOT NULL
+    FROM night_parts
+    WHERE night_minutes > 0
+      AND night_date BETWEEN first_night AND last_night
 ),
 
-nightly_unit_vectors AS (
+by_cbg AS (
+
+    SELECT
+        cuebiq_id,
+        block_group_id,
+        SUM(night_minutes) AS cbg_night_minutes,
+        COUNT(DISTINCT night_date) AS n_nights_at_cbg
+
+    FROM away_nights
+    GROUP BY cuebiq_id, block_group_id
+),
+
+ranked AS (
 
     SELECT
         *,
-        COS(RADIANS(lat)) * COS(RADIANS(lng)) AS sphere_x,
-        COS(RADIANS(lat)) * SIN(RADIANS(lng)) AS sphere_y,
-        SIN(RADIANS(lat)) AS sphere_z
-    FROM night_stops_filtered
-),
-
-nightly_center AS (
-
-    SELECT
-        cuebiq_id,
-        night_date,
-        SUM(dwell_time_minutes_in_event_date * sphere_x)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_x,
-        SUM(dwell_time_minutes_in_event_date * sphere_y)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_y,
-        SUM(dwell_time_minutes_in_event_date * sphere_z)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_z
-    FROM nightly_unit_vectors
-    GROUP BY cuebiq_id, night_date
-),
-
-nightly_center_geog AS (
-
-    SELECT
-        cuebiq_id,
-        night_date,
-        DEGREES(ATAN2(mean_z, SQRT(mean_x * mean_x + mean_y * mean_y)))
-            AS night_lat,
-        DEGREES(ATAN2(mean_y, mean_x)) AS night_lng
-    FROM nightly_center
-),
-
-nightly_center_final AS (
-
-    SELECT
-        *,
-        ST_MAKEPOINT(night_lng, night_lat) AS night_geog
-    FROM nightly_center_geog
-),
-
-night_pairs AS (
-
-    SELECT
-        a.cuebiq_id,
-        a.night_date AS night_date_a,
-        b.night_date AS night_date_b,
-        ST_DISTANCE(a.night_geog, b.night_geog) / 1000.0 AS distance_km
-
-    FROM nightly_center_final AS a
-
-    INNER JOIN nightly_center_final AS b
-        ON a.cuebiq_id = b.cuebiq_id
-       AND a.night_date <> b.night_date
-),
-
-night_cluster_size AS (
-
-    -- cluster_size = self (1) + however many OTHER nights are within radius
-    SELECT
-        c.cuebiq_id,
-        c.night_date,
-        1 + COALESCE(
-            (
-                SELECT COUNT_IF(p.distance_km <= $HOME_LOCATION_RADIUS_KM)
-                FROM night_pairs AS p
-                WHERE p.cuebiq_id = c.cuebiq_id
-                  AND p.night_date_a = c.night_date
-            ),
-            0
-        ) AS cluster_size
-
-    FROM nightly_center_final AS c
-),
-
-qualifying_nights AS (
-
-    SELECT *
-    FROM night_cluster_size
-    WHERE cluster_size >= $MIN_CONSECUTIVE_NIGHTS_AT_DESTINATION
-),
-
-anchor_night AS (
-
-    SELECT
-        cuebiq_id,
-        night_date AS anchor_night_date,
+        SUM(cbg_night_minutes) OVER (PARTITION BY cuebiq_id) AS total_night_minutes,
         ROW_NUMBER() OVER (
-            PARTITION BY cuebiq_id ORDER BY night_date DESC
-        ) AS anchor_rank
-    FROM qualifying_nights
+            PARTITION BY cuebiq_id
+            ORDER BY cbg_night_minutes DESC, block_group_id ASC
+        ) AS cbg_rank
+
+    FROM by_cbg
 ),
 
-destination_nights AS (
+fips_lookup (state_abbr, state_fips) AS (
 
-    SELECT a.cuebiq_id, a.anchor_night_date AS night_date
-    FROM anchor_night AS a
-    WHERE a.anchor_rank = 1
-
-    UNION
-
-    SELECT p.cuebiq_id, p.night_date_b AS night_date
-    FROM night_pairs AS p
-    INNER JOIN anchor_night AS a
-        ON p.cuebiq_id = a.cuebiq_id
-       AND p.night_date_a = a.anchor_night_date
-    WHERE a.anchor_rank = 1
-      AND p.distance_km <= $HOME_LOCATION_RADIUS_KM
-),
-
-destination_stops AS (
-
-    SELECT ns.*
-    FROM night_stops_filtered AS ns
-    INNER JOIN destination_nights AS d
-        ON ns.cuebiq_id = d.cuebiq_id
-       AND ns.night_date = d.night_date
-),
-
-destination_unit_vectors AS (
-
-    SELECT
-        *,
-        COS(RADIANS(lat)) * COS(RADIANS(lng)) AS sphere_x,
-        COS(RADIANS(lat)) * SIN(RADIANS(lng)) AS sphere_y,
-        SIN(RADIANS(lat)) AS sphere_z
-    FROM destination_stops
-),
-
-destination_weighted AS (
-
-    SELECT
-        cuebiq_id,
-        SUM(dwell_time_minutes_in_event_date * sphere_x)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_x,
-        SUM(dwell_time_minutes_in_event_date * sphere_y)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_y,
-        SUM(dwell_time_minutes_in_event_date * sphere_z)
-            / SUM(dwell_time_minutes_in_event_date) AS mean_z,
-
-        COUNT(DISTINCT night_date) AS n_destination_nights,
-        MIN(night_date) AS destination_arrival_night,
-        MAX(night_date) AS destination_last_confirmed_night
-
-    FROM destination_unit_vectors
-    GROUP BY cuebiq_id
-),
-
-destination_center AS (
-
-    SELECT
-        cuebiq_id,
-        n_destination_nights,
-        destination_arrival_night,
-        destination_last_confirmed_night,
-        DEGREES(ATAN2(mean_z, SQRT(mean_x * mean_x + mean_y * mean_y)))
-            AS destination_lat,
-        DEGREES(ATAN2(mean_y, mean_x)) AS destination_lng
-    FROM destination_weighted
+    SELECT * FROM VALUES
+        ('AL','01'),('AK','02'),('AZ','04'),('AR','05'),('CA','06'),('CO','08'),
+        ('CT','09'),('DE','10'),('DC','11'),('FL','12'),('GA','13'),('HI','15'),
+        ('ID','16'),('IL','17'),('IN','18'),('IA','19'),('KS','20'),('KY','21'),
+        ('LA','22'),('ME','23'),('MD','24'),('MA','25'),('MI','26'),('MN','27'),
+        ('MS','28'),('MO','29'),('MT','30'),('NE','31'),('NV','32'),('NH','33'),
+        ('NJ','34'),('NM','35'),('NY','36'),('NC','37'),('ND','38'),('OH','39'),
+        ('OK','40'),('OR','41'),('PA','42'),('RI','44'),('SC','45'),('SD','46'),
+        ('TN','47'),('TX','48'),('UT','49'),('VT','50'),('VA','51'),('WA','53'),
+        ('WV','54'),('WI','55'),('WY','56'),('PR','72')
 )
 
 SELECT
-    cuebiq_id,
-    n_destination_nights,
-    destination_arrival_night,
-    destination_last_confirmed_night,
-    destination_lat,
-    destination_lng,
-    ST_MAKEPOINT(destination_lng, destination_lat) AS destination_geog
+    r.cuebiq_id,
+    r.block_group_id AS destination_block_group_id,
 
-FROM destination_center;
+    CASE
+        WHEN f.state_fips IS NOT NULL
+         AND LENGTH(SPLIT_PART(r.block_group_id, '.', 3)) = 3
+         AND LENGTH(SPLIT_PART(r.block_group_id, '.', 4)) = 6
+         AND LENGTH(SPLIT_PART(r.block_group_id, '.', 5)) = 1
+        THEN f.state_fips
+             || SPLIT_PART(r.block_group_id, '.', 3)
+             || SPLIT_PART(r.block_group_id, '.', 4)
+             || SPLIT_PART(r.block_group_id, '.', 5)
+    END AS destination_cbg,
+
+    r.cbg_night_minutes AS destination_night_minutes,
+    r.n_nights_at_cbg   AS destination_n_nights,
+    ROUND(r.cbg_night_minutes / NULLIF(r.total_night_minutes, 0), 3)
+        AS destination_night_share
+
+FROM ranked AS r
+
+LEFT JOIN fips_lookup AS f
+    ON SPLIT_PART(r.block_group_id, '.', 2) = f.state_abbr
+
+WHERE r.cbg_rank = 1;
 
 
--- ===== sql/05_persistence/06_evacuation_distance.sql =====
+-- ===== sql/05_persistence/05_individual_table.sql =====
 -- Run ../../PARAMETERS.sql first in the same Snowflake session.
 --
--- Final summary table for the persistence stage: one row per candidate
--- evacuee, combining departure, return, home location, destination
--- location, and the single home->destination "evacuation distance" number
--- requested for this analysis. A candidate may have no confirmed return
--- in the observed data (return still pending as of RETURN_END), and
--- FL_EVAC_DESTINATION can be missing for a candidate whose away-period
--- nights never formed a qualifying same-place cluster (sparse data) --
--- those rows keep their other fields and simply have NULLs where the
--- missing piece would go. FL_HOME_LOCATION is always present here, since
--- 03_candidates.sql already inner-joins it (home-location gate); its LEFT
--- JOIN below is kept only as a harmless safeguard.
+-- Final individual-level table: one row per FL_RESIDENT device.
+--
+--   in_cohort        1 if the device passed the cohort data requirements
+--   evacuee          NULL if not in cohort; 1 if a departure was detected; else 0
+--   departure_phase  1 (pre-landfall), 2 (landfall), 3 (post-landfall)
+--   returned_by_end  NULL for non-evacuees; 1 if a return was detected by OBS_END
+--   days_away        return_date - departure_date (NULL if not returned)
+--   home_cbg         HOME_GEO10 from 00_residents_detection (Cuebiq recurring home)
+--   destination_cbg  12-digit GEO10 of the destination block group
+--
+-- Aggregation to CBG and any distance calculation are done outside Snowflake.
 
 CREATE OR REPLACE TRANSIENT TABLE
-DEDICATED.HOUPU.FL_EVAC_SUMMARY
+DEDICATED.HOUPU.FL_EVAC_INDIVIDUAL
 AS
 
 SELECT
-    c.cuebiq_id,
+    r.cuebiq_id,
+    r.home_geo10 AS home_cbg,
 
-    -- departure
-    c.candidate_start_date,
-    c.candidate_streak_end_date,
-    c.candidate_streak_length,
-    c.candidate_streak_calendar_span_days,
+    IFF(c.cuebiq_id IS NOT NULL, 1, 0) AS in_cohort,
 
-    -- return
-    r.return_date,
-    r.return_streak_length,
-    r.return_streak_calendar_span_days,
-
-    -- home location
-    h.n_home_nights,
-    h.home_lat,
-    h.home_lng,
-
-    -- destination location
-    d.n_destination_nights,
-    d.destination_arrival_night,
-    d.destination_last_confirmed_night,
-    d.destination_lat,
-    d.destination_lng,
-
-    -- evacuation distance: single home -> destination number, NULL if
-    -- either endpoint could not be determined
     CASE
-        WHEN h.home_geog IS NOT NULL AND d.destination_geog IS NOT NULL
-            THEN ST_DISTANCE(h.home_geog, d.destination_geog) / 1000.0
-        ELSE NULL
-    END AS evacuation_distance_km
+        WHEN c.cuebiq_id IS NULL THEN NULL
+        WHEN d.cuebiq_id IS NOT NULL THEN 1
+        ELSE 0
+    END AS evacuee,
 
-FROM DEDICATED.HOUPU.FL_EVAC_CANDIDATES AS c
+    d.departure_phase,
+    d.departure_date,
+    d.departure_streak_end_date,
+    d.departure_streak_length,
 
-LEFT JOIN DEDICATED.HOUPU.FL_EVAC_RETURN_DATES AS r
-    ON c.cuebiq_id = r.cuebiq_id
+    t.return_date,
+    CASE
+        WHEN d.cuebiq_id IS NULL THEN NULL
+        WHEN t.return_date IS NOT NULL THEN 1
+        ELSE 0
+    END AS returned_by_end,
+    t.days_away,
 
-LEFT JOIN DEDICATED.HOUPU.FL_HOME_LOCATION AS h
-    ON c.cuebiq_id = h.cuebiq_id
+    x.destination_cbg,
+    x.destination_block_group_id,
+    x.destination_n_nights,
+    x.destination_night_share
 
-LEFT JOIN DEDICATED.HOUPU.FL_EVAC_DESTINATION AS d
-    ON c.cuebiq_id = d.cuebiq_id;
+FROM DEDICATED.HOUPU.FL_RESIDENT AS r
+
+LEFT JOIN DEDICATED.HOUPU.FL_ALLDAY_COHORT AS c
+    ON r.cuebiq_id = c.cuebiq_id
+
+LEFT JOIN DEDICATED.HOUPU.FL_EVAC_DEPARTURE AS d
+    ON r.cuebiq_id = d.cuebiq_id
+
+LEFT JOIN DEDICATED.HOUPU.FL_EVAC_RETURN AS t
+    ON r.cuebiq_id = t.cuebiq_id
+
+LEFT JOIN DEDICATED.HOUPU.FL_EVAC_DESTINATION_CBG AS x
+    ON r.cuebiq_id = x.cuebiq_id;

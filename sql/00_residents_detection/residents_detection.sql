@@ -1,0 +1,155 @@
+-- residents_detection
+-- Builds DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL: one row per device whose
+-- Cuebiq DEVICE_RECURRING_AREA home falls in a mandatory-evacuation-zone CBG
+-- (HURRICANE_IAN_MANDATORY_CBG_CROSS) on at least one baseline day, with
+-- daily home CBGs (21 columns), summary metrics, and five IS_RESID_* flags.
+-- Consumed by ../01_preprocessing/00_build_resident.sql (IS_RESID_1_5 = 1).
+--
+-- Does NOT read PARAMETERS.sql: the baseline window (20220902..20220922) and
+-- its length (21 days) are hard-coded below and must be kept in sync with
+-- BASELINE_START / BASELINE_END by hand.
+--
+-- QC queries (optional, commented out):
+--   (a) devices reported by more than one provider during baseline;
+--   (b) device-days with more than one distinct HOME block group.
+
+-- SELECT CUEBIQ_ID, COUNT(DISTINCT PROVIDER_ID) AS N_PROVIDERS
+-- FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.DEVICE_RECURRING_AREA
+-- WHERE COUNTRY_CODE = 'US'
+--   AND SNAPSHOT_EVENT_DATE BETWEEN 20220902 AND 20220922
+-- GROUP BY CUEBIQ_ID
+-- HAVING COUNT(DISTINCT PROVIDER_ID) > 1;
+
+-- SELECT CUEBIQ_ID, SNAPSHOT_EVENT_DATE, COUNT(DISTINCT BLOCK_GROUP_ID) AS N_DISTINCT_CBG
+-- FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.DEVICE_RECURRING_AREA
+-- WHERE COUNTRY_CODE = 'US'
+--   AND TAG_TYPE_CODE = 'HOME'
+--   AND SNAPSHOT_EVENT_DATE BETWEEN 20220902 AND 20220922
+-- GROUP BY CUEBIQ_ID, SNAPSHOT_EVENT_DATE
+-- HAVING COUNT(DISTINCT BLOCK_GROUP_ID) > 1;
+
+-- STEP 0: CBG lookup -- convert 12-digit GEO10 (state 2, county 3, tract 6,
+-- block group 1) into Cuebiq's BLOCK_GROUP_ID format 'US.FL.ccc.tttttt.b'.
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.CBG_CUEBIQ_LOOKUP AS
+SELECT
+    GEO20,
+    GEO10,
+    'US.FL.' || SUBSTR(GEO10, 3, 3) || '.' || SUBSTR(GEO10, 6, 6) || '.' || SUBSTR(GEO10, 12, 1)
+        AS CUEBIQ_BLOCK_GROUP_ID
+FROM DEDICATED.HOUPU.HURRICANE_IAN_MANDATORY_CBG_CROSS;
+
+-- STEP 1: daily home detail. Keep HOME tags in target CBGs with
+-- CONFIDENCE_LEVEL > 0.5; if a device has several on the same day, keep the
+-- one with the highest CONFIDENCE_LEVEL (ties -> lowest GEO10).
+-- Note: the join to target CBGs happens BEFORE the daily ranking, so a
+-- lower-confidence target-CBG home still counts on a day when the device's
+-- top-confidence home is outside the target area.
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY AS
+WITH joined AS (
+    SELECT
+        d.CUEBIQ_ID,
+        l.GEO10,
+        TO_DATE(TO_VARCHAR(d.SNAPSHOT_EVENT_DATE), 'YYYYMMDD') AS SNAPSHOT_DATE,
+        d.CONFIDENCE_LEVEL,
+        d.PROVIDER_ID
+    FROM CUEBIQ_DATA.PAAS_CDA_PE_V3.DEVICE_RECURRING_AREA d
+    JOIN DEDICATED.HOUPU.CBG_CUEBIQ_LOOKUP l
+        ON d.BLOCK_GROUP_ID = l.CUEBIQ_BLOCK_GROUP_ID
+    WHERE d.TAG_TYPE_CODE = 'HOME'
+      AND d.COUNTRY_CODE = 'US'
+      AND d.SNAPSHOT_EVENT_DATE BETWEEN 20220902 AND 20220922
+      AND d.CONFIDENCE_LEVEL > 0.5   -- confidence floor
+),
+ranked AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY CUEBIQ_ID, SNAPSHOT_DATE
+            ORDER BY CONFIDENCE_LEVEL DESC, GEO10 ASC
+        ) AS rn
+    FROM joined
+)
+SELECT CUEBIQ_ID, GEO10, SNAPSHOT_DATE
+FROM ranked
+WHERE rn = 1;
+
+-- STEP 2: per-device summary + five IS_RESID tiers (intermediate table, dropped below).
+-- DAYS_IN_TARGET_CBGS = days with a home in ANY target CBG; HOME_GEO10 = the
+-- CBG with the most days; IS_RESID_a_b = DAYS_IN_TARGET_CBGS >= CEIL(21 * a/b),
+-- i.e. 1_5 >= 5, 1_4 >= 6, 1_3 >= 7, 1_2 >= 11, 2_3 >= 14 days.
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_SUMMARY AS
+WITH total_days AS (
+    SELECT CUEBIQ_ID, COUNT(DISTINCT SNAPSHOT_DATE) AS DAYS_IN_TARGET_CBGS
+    FROM DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY
+    GROUP BY CUEBIQ_ID
+),
+device_geo10_days AS (
+    SELECT CUEBIQ_ID, GEO10, COUNT(DISTINCT SNAPSHOT_DATE) AS DAYS_AT_THIS_CBG
+    FROM DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY
+    GROUP BY CUEBIQ_ID, GEO10
+),
+home_ranked AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY CUEBIQ_ID
+            ORDER BY DAYS_AT_THIS_CBG DESC, GEO10 ASC
+        ) AS rn
+    FROM device_geo10_days
+),
+home AS (
+    SELECT CUEBIQ_ID, GEO10 AS HOME_GEO10, DAYS_AT_THIS_CBG AS DAYS_AT_HOME_CBG
+    FROM home_ranked WHERE rn = 1
+)
+SELECT
+    t.CUEBIQ_ID,
+    h.HOME_GEO10,
+    t.DAYS_IN_TARGET_CBGS,
+    h.DAYS_AT_HOME_CBG,
+    ROUND(h.DAYS_AT_HOME_CBG / t.DAYS_IN_TARGET_CBGS, 2) AS HOME_CONSISTENCY,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/5) THEN 1 ELSE 0 END AS IS_RESID_1_5,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/4) THEN 1 ELSE 0 END AS IS_RESID_1_4,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/3) THEN 1 ELSE 0 END AS IS_RESID_1_3,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 1.0/2) THEN 1 ELSE 0 END AS IS_RESID_1_2,
+    CASE WHEN t.DAYS_IN_TARGET_CBGS >= CEIL(21 * 2.0/3) THEN 1 ELSE 0 END AS IS_RESID_2_3
+FROM total_days t
+JOIN home h ON t.CUEBIQ_ID = h.CUEBIQ_ID;
+
+-- STEP 3: pivot daily home GEO10 into 21 date columns + attach STEP 2 summary -- final table
+CREATE OR REPLACE TABLE DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_FULL AS
+WITH pivoted AS (
+    SELECT *
+    FROM DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY
+    PIVOT (MAX(GEO10) FOR SNAPSHOT_DATE IN (
+        '2022-09-02','2022-09-03','2022-09-04','2022-09-05','2022-09-06',
+        '2022-09-07','2022-09-08','2022-09-09','2022-09-10','2022-09-11',
+        '2022-09-12','2022-09-13','2022-09-14','2022-09-15','2022-09-16',
+        '2022-09-17','2022-09-18','2022-09-19','2022-09-20','2022-09-21',
+        '2022-09-22'
+    )) AS p (
+        CUEBIQ_ID,
+        "2022-09-02","2022-09-03","2022-09-04","2022-09-05","2022-09-06",
+        "2022-09-07","2022-09-08","2022-09-09","2022-09-10","2022-09-11",
+        "2022-09-12","2022-09-13","2022-09-14","2022-09-15","2022-09-16",
+        "2022-09-17","2022-09-18","2022-09-19","2022-09-20","2022-09-21",
+        "2022-09-22"
+    )
+)
+SELECT
+    p.*,
+    s.HOME_GEO10,
+    s.DAYS_IN_TARGET_CBGS,
+    s.DAYS_AT_HOME_CBG,
+    s.HOME_CONSISTENCY,
+    s.IS_RESID_1_5,
+    s.IS_RESID_1_4,
+    s.IS_RESID_1_3,
+    s.IS_RESID_1_2,
+    s.IS_RESID_2_3
+FROM pivoted p
+JOIN DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_SUMMARY s
+    ON p.CUEBIQ_ID = s.CUEBIQ_ID;
+
+-- CLEANUP: keep only FL_RECURRING_RESIDENTS_FULL; drop intermediate tables
+DROP TABLE IF EXISTS DEDICATED.HOUPU.IAN_RECURRING_HOME_DAILY;
+DROP TABLE IF EXISTS DEDICATED.HOUPU.CBG_CUEBIQ_LOOKUP;
+DROP TABLE IF EXISTS DEDICATED.HOUPU.FL_RECURRING_RESIDENTS_SUMMARY;
+

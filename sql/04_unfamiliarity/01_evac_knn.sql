@@ -1,14 +1,10 @@
 -- Run ../../PARAMETERS.sql first in the same Snowflake session.
 --
--- Table name is kept as FL_EVAC_KNN for backward compatibility (03_unfamiliar_days.sql
--- joins to it by name), but as of this version it covers every day
--- from EVAC_START through RETURN_END, not just the evacuation window. EVAC_END and
--- RETURN_START are back-to-back (2022-09-30 -> 2022-10-01), so this is one
--- contiguous range. The extra RETURN-window rows let 03_unfamiliar_days.sql produce
--- an unfamiliar_day flag for every day after departure too, which
--- 05_persistence/04_return_detection.sql uses to detect when a candidate returned
--- home (the same personal baseline is used as the comparison set throughout, since
--- "baseline" below is unchanged).
+-- Scores every day from PHASE1_START through OBS_END (9/23-10/23) against the
+-- user's baseline daily centers. Covering the whole post-baseline range lets
+-- 05_persistence build departure streaks (which may run past DEPARTURE_END)
+-- and detect returns up to OBS_END. The table name FL_EVAC_KNN is kept for
+-- continuity; 03_unfamiliar_days.sql joins to it by name.
 
 CREATE OR REPLACE TRANSIENT TABLE
 DEDICATED.HOUPU.FL_EVAC_KNN
@@ -35,7 +31,7 @@ target_days AS (
         center_geog
 
     FROM DEDICATED.HOUPU.FL_ALLDAY_DAILY_CENTER
-    WHERE event_date BETWEEN $EVAC_START AND $RETURN_END
+    WHERE event_date BETWEEN $PHASE1_START AND $OBS_END
 ),
 
 pairwise AS (

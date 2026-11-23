@@ -12,7 +12,7 @@ Run `../../PARAMETERS.sql` first in the same session, then `01_daily_weighted_ce
 
 ## What it does
 
-1. Keeps stops of cohort users on days with `eligible_day = 1`. This covers every date in the extracted range (baseline through `RETURN_END`).
+1. Keeps stops of cohort users on days with `eligible_day = 1`. This covers every date in the extracted range (baseline through `OBS_END`).
 2. Converts each stop's `lat`/`lng` to a 3-D unit vector on the sphere.
 3. Averages the vectors with weight `dwell_time_minutes_in_event_date`, which comes from the de-conflicted table, so overlapping time is not double-counted.
 4. Converts the mean vector back to `center_lat`/`center_lng` and builds `center_geog = ST_MAKEPOINT(lng, lat)`.

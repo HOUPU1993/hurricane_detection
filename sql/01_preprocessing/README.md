@@ -4,7 +4,7 @@ Builds the study population, extracts its Cuebiq stops, cleans them into a non-o
 
 ## Run order
 
-Run `../../PARAMETERS.sql` first in the same Snowflake session, then:
+Requires `FL_RECURRING_RESIDENTS_FULL` from `../00_residents_detection/`. Run `../../PARAMETERS.sql` first in the same Snowflake session, then:
 
 | # | Script | Reads | Writes |
 |---|---|---|---|
@@ -22,7 +22,7 @@ All output tables are `TRANSIENT` in `DEDICATED.HOUPU`.
 
 **`01_extract_stops.sql`** — Inner-joins Cuebiq stops to `FL_RESIDENT` and keeps stops that:
 
-- have `event_date` between `BASELINE_START` and `RETURN_END`;
+- have `event_date` between `BASELINE_START` and `OBS_END`;
 - come from `PROVIDER_1` or `PROVIDER_2`;
 - are not `UPLEVELLED` when `EXCLUDE_UPLEVELLED = 1`;
 - have `dwell_time_minutes_in_event_date > 0` and non-null `lat`/`lng`.
@@ -54,7 +54,7 @@ It adds an `is_uplevelled` flag and keeps accuracy/provenance fields for QC.
 |---|---|---|
 | `PROVIDER_1`, `PROVIDER_2` | `SIERRA`, `LIMA` | 01 |
 | `EXCLUDE_UPLEVELLED` | 0 | 01 |
-| `BASELINE_START`, `RETURN_END` | 20220902, 20221023 | 01 |
+| `BASELINE_START`, `OBS_END` | 20220902, 20221023 | 01 |
 | `MIN_COVERED_STOP_MINUTES` | 120 | 04 |
 | `MIN_OBSERVATION_SPAN_MINUTES` | 240 | 04 |
 | `MAX_OVERLAPPING_ROWS` | 0 | 04 |

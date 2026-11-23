@@ -18,14 +18,15 @@ SELECT
     ) AS n_baseline_eligible_days,
 
     COUNT_IF(
-        d.event_date BETWEEN $EVAC_START AND $EVAC_END
+        d.event_date BETWEEN $PHASE1_START AND $DEPARTURE_END
         AND d.eligible_day = 1
-    ) AS n_evacuation_eligible_days,
+    ) AS n_departure_window_eligible_days,
 
     COUNT_IF(
-        d.event_date BETWEEN $RETURN_START AND $RETURN_END
+        d.event_date > $DEPARTURE_END
+        AND d.event_date <= $OBS_END
         AND d.eligible_day = 1
-    ) AS n_return_eligible_days,
+    ) AS n_post_window_eligible_days,
 
     COUNT_IF(d.conflict_day = 1) AS n_conflict_days
 
@@ -50,4 +51,4 @@ AS
 SELECT *
 FROM DEDICATED.HOUPU.FL_ALLDAY_COHORT_COUNTS
 WHERE n_baseline_eligible_days >= $MIN_BASELINE_ELIGIBLE_DAYS
-  AND n_evacuation_eligible_days >= $MIN_EVAC_ELIGIBLE_DAYS;
+  AND n_departure_window_eligible_days >= $MIN_DEPARTURE_WINDOW_ELIGIBLE_DAYS;

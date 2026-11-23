@@ -14,13 +14,13 @@ Run `../../PARAMETERS.sql` first in the same session, then:
 
 ## What each script does
 
-**`01_evac_knn.sql`** — For every target day from `EVAC_START` through `RETURN_END`:
+**`01_evac_knn.sql`** — For every target day from `PHASE1_START` through `OBS_END` (9/23–10/23):
 
 1. Computes the distance (km, `ST_DISTANCE`) from that day's center to each of the user's baseline daily centers.
 2. Keeps the `K_NEIGHBORS` nearest (ties broken by baseline date).
 3. Outputs `evac_knn_score_km` (mean of the k distances), `nearest_baseline_day_km`, and `kth_nearest_baseline_day_km`.
 
-Days with fewer than k baseline neighbors are dropped. The table name says "evac", but it also covers the return window, which `05_persistence/04_return_detection.sql` needs.
+Days with fewer than k baseline neighbors are dropped. The range covers all three departure phases and the return observation period, which `05_persistence` needs for departure streaks and return detection.
 
 **`02_baseline_loo_knn.sql`** — The same kNN score for each baseline day, computed against the user's *other* baseline days (leave-one-out). Output: `loo_knn_score_km`.
 
@@ -39,6 +39,6 @@ A day with no row here (not eligible, or not scored) is treated as *missing* in 
 |---|---|---|
 | `K_NEIGHBORS` | 3 | neighbors in the kNN score |
 | `BASELINE_START..BASELINE_END` | 20220902..20220922 | reference days |
-| `EVAC_START..RETURN_END` | 20220923..20221023 | scored days |
+| `PHASE1_START..OBS_END` | 20220923..20221023 | scored days |
 
 The decision rule (score > personal LOO maximum) is hard-coded in `03_unfamiliar_days.sql`. The other summary columns are kept for alternative rules or sensitivity checks.

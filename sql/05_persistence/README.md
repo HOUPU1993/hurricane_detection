@@ -1,84 +1,128 @@
 # 05_persistence
 
-Turns daily unfamiliarity flags into candidate evacuees, then adds departure date, return date, home, destination, and evacuation distance. The final output is `FL_EVAC_SUMMARY`.
+Turns daily unfamiliarity flags into departure, return, and destination for each cohort user. The final individual-level table is `FL_EVAC_INDIVIDUAL`, with one row per resident.
 
 ## Run order
 
-Run `../../PARAMETERS.sql` first in the same session, then run the scripts in filename order. `02_home_location.sql` must run before `03_candidates.sql`, which joins to it.
+Run `../../PARAMETERS.sql` first in the same session, then run the scripts in filename order.
 
 | # | Script | Reads | Writes |
 |---|---|---|---|
-| 1 | `01_unfamiliar_streaks.sql` | `FL_ALLDAY_COHORT`, `FL_EVAC_KNN_RARITY` | `FL_EVAC_FLAG_STREAKS` |
-| 2 | `02_home_location.sql` | `FL_ALLDAY_STOPS_UNIONED` | `FL_HOME_LOCATION` |
-| 3 | `03_candidates.sql` | `FL_EVAC_FLAG_STREAKS`, `FL_HOME_LOCATION` | `FL_EVAC_CANDIDATES` |
-| 4 | `04_return_detection.sql` | `FL_EVAC_CANDIDATES`, `FL_EVAC_KNN_RARITY` | `FL_EVAC_RETURN_DATES` |
-| 5 | `05_destination_location.sql` | `FL_EVAC_CANDIDATES`, `FL_EVAC_RETURN_DATES`, `FL_ALLDAY_STOPS_UNIONED` | `FL_EVAC_DESTINATION` |
-| 6 | `06_evacuation_distance.sql` | `FL_EVAC_CANDIDATES`, `FL_EVAC_RETURN_DATES`, `FL_HOME_LOCATION`, `FL_EVAC_DESTINATION` | `FL_EVAC_SUMMARY` |
+| 1 | `01_daily_states.sql` | `FL_ALLDAY_COHORT`, `FL_EVAC_KNN_RARITY` | `FL_DAILY_STATE` |
+| 2 | `02_departure.sql` | `FL_DAILY_STATE` | `FL_EVAC_DEPARTURE` |
+| 3 | `03_return.sql` | `FL_DAILY_STATE`, `FL_EVAC_DEPARTURE` | `FL_EVAC_RETURN` |
+| 4 | `04_destination_cbg.sql` | `FL_EVAC_DEPARTURE`, `FL_EVAC_RETURN`, `FL_ALLDAY_STOPS_UNIONED` | `FL_EVAC_DESTINATION_CBG` |
+| 5 | `05_individual_table.sql` | `FL_RESIDENT`, `FL_ALLDAY_COHORT`, and tables 2–4 | **`FL_EVAC_INDIVIDUAL`** |
 
-`01` and `04` set helper session variables (`N_EVAC_CALENDAR_DAYS`, `N_RETURN_CALENDAR_DAYS`), because `GENERATOR(ROWCOUNT => ...)` needs a constant.
+`01_daily_states.sql` also sets the helper session variable `N_STATE_DAYS`, because `GENERATOR(ROWCOUNT => ...)` needs a constant.
 
-## Three-state day model
+## Phases
 
-Scripts 01 and 04 build a full calendar per user and classify every day as:
+| Phase | Dates | Meaning |
+|---|---|---|
+| 1 | `PHASE1_START`..`PHASE2_START`-1 (9/23–9/27) | pre-landfall |
+| 2 | `PHASE2_START`..`PHASE3_START`-1 (9/28–9/30) | landfall (Ian landfall 9/28) |
+| 3 | `PHASE3_START`..`DEPARTURE_END` (10/1–10/7) | post-landfall |
+| 4 | after `DEPARTURE_END` to `OBS_END` (10/8–10/23) | return observation only |
 
-| State | Condition | Departure side (01) | Return side (04) |
-|---|---|---|---|
-| 1 unfamiliar | `unfamiliar_day = 1` | counted in streak | hard break |
-| 2 familiar | `unfamiliar_day = 0` | hard break | counted in streak |
-| 3 missing | no row in `FL_EVAC_KNN_RARITY` | bridged if ≤ `MAX_GAP_DAYS_TO_BRIDGE` consecutive days | same |
+## Day states (`01_daily_states.sql`)
 
-`streak_length` counts confirmed days only. `streak_calendar_span_days` also counts bridged missing days.
+Each cohort user gets every calendar day from 9/23 to 10/23. Each day is classified as:
 
-## What each script does
+| `day_state` | Condition |
+|---|---|
+| 1 unfamiliar | `unfamiliar_day = 1` |
+| 2 familiar | `unfamiliar_day = 0` |
+| 3 missing | no row in `FL_EVAC_KNN_RARITY` (day not eligible) |
 
-**`01_unfamiliar_streaks.sql`** — Builds unfamiliar streaks in `EVAC_START..EVAC_END`. A streak gets `reaches_window_end = 1` when two conditions hold:
+## Departure rule (`02_departure.sql`)
 
-- its last unfamiliar day is within `MAX_GAP_DAYS_TO_BRIDGE` days of `PERSISTENCE_CHECK_END` (or later);
-- no confirmed familiar day falls between the streak end and `PERSISTENCE_CHECK_END`.
+1. Unfamiliar streaks are built over the full 9/23–10/23 range, so a streak can cross phase boundaries:
+   - a familiar day always breaks a streak;
+   - up to `MAX_GAP_DAYS_TO_BRIDGE` consecutive missing days are bridged;
+   - `streak_length` counts confirmed unfamiliar days only.
+2. A streak qualifies if:
+   - its **start** falls between `PHASE1_START` and `DEPARTURE_END`;
+   - `streak_length >= MIN_CONSECUTIVE_UNFAMILIAR_DAYS`;
+   - **phase 1 only:** the person is still away on landfall day (`PHASE2_START`). That means the streak ends within `MAX_GAP_DAYS_TO_BRIDGE` days of 9/28 or later, and no familiar day falls between its end and 9/28. This excludes ordinary trips that ended before the storm.
+3. The **earliest** qualifying streak is the departure:
+   - `departure_date` = streak start;
+   - `departure_phase` = the phase of that date.
 
-**`02_home_location.sql`** — Estimates home for every resident with baseline nighttime stops, not only candidates:
+A user whose phase-1 trip ended before landfall can still qualify through a later phase-2 or phase-3 streak.
 
-1. Nighttime stops are those whose `segment_start` hour is ≥ `NIGHT_START_HOUR` or < `NIGHT_END_HOUR`. Early-morning stops are assigned to the previous evening's night.
-2. One weighted center is computed per night.
-3. The night with the most other nights within `HOME_LOCATION_RADIUS_KM` is the anchor (ties go to the earliest night).
-4. Home nights are the anchor plus all nights within the radius of it.
-5. Home is the weighted center of the raw stops from those nights.
+## Return rule (`03_return.sql`)
 
-Output: `n_home_nights`, `home_lat`, `home_lng`, `home_geog`.
+The return rule is the same for all phases, mirrored from the departure rule. Familiar days build a streak, an unfamiliar day breaks it, and missing days are bridged in the same way.
 
-**`03_candidates.sql`** — A candidate needs both:
+- `return_date` is the start of the first familiar streak that begins after `departure_streak_end_date` and has at least `MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN` days. The search runs through `OBS_END`.
+- `days_away` = `return_date - departure_date`.
+- Evacuees with no qualifying familiar streak have no row: they had not returned by `OBS_END`.
 
-- a streak with `reaches_window_end = 1` and `streak_length ≥ MIN_CONSECUTIVE_UNFAMILIAR_DAYS`;
-- a home in `FL_HOME_LOCATION` inside the Florida box (`FL_HOME_LAT_MIN..MAX`, `FL_HOME_LNG_MIN..MAX`). Users without a home row are excluded.
+## Destination (`04_destination_cbg.sql`)
 
-At most one streak per user can qualify. `candidate_start_date` is the departure date.
+- **Away nights:** from `departure_date` to `return_date - 1`. If no return was detected, the last night is `OBS_END`.
+- **Night window:** night *d* runs from `NIGHT_START_HOUR` on day *d* to `NIGHT_END_HOUR` on day *d+1*.
+- **Clipping:** each stop interval from `FL_ALLDAY_STOPS_UNIONED` (overlaps already resolved) is clipped to the night window in minutes.
+- **Choice of CBG:** minutes are summed by `block_group_id`. The block group with the most minutes is the destination (ties → lowest ID).
+- **CBG format:** Cuebiq's `US.<ST>.<county>.<tract>.<bg>` is converted to a 12-digit GEO10 with a state-abbreviation → FIPS lookup. IDs that do not match this format get `destination_cbg = NULL`; the raw ID is kept.
 
-**`04_return_detection.sql`** — For each candidate, finds familiar streaks in `RETURN_START..RETURN_END` with the mirrored state model. The earliest streak with `streak_length ≥ MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN` gives `return_date`. Candidates with no qualifying streak have no row, meaning return was not observed by `RETURN_END`.
+QC fields:
 
-**`05_destination_location.sql`** — Searches nighttime stops from `candidate_start_date` through the day before `return_date`, or through `RETURN_END` if no return was found:
+- `destination_n_nights`: nights with any stop in that block group;
+- `destination_night_share`: that block group's share of all away-night minutes.
 
-1. A night qualifies when it plus the other nights within `HOME_LOCATION_RADIUS_KM` number at least `MIN_CONSECUTIVE_NIGHTS_AT_DESTINATION`. These nights do not have to be consecutive; the match is by distance only.
-2. The most recent qualifying night is the anchor.
-3. The destination is the weighted center of the anchor plus all nights within the radius of it.
+## Final table `FL_EVAC_INDIVIDUAL`
 
-Output: `n_destination_nights`, `destination_arrival_night`, `destination_last_confirmed_night`, `destination_lat`, `destination_lng`.
+| Column | Definition |
+|---|---|
+| `cuebiq_id` | device ID |
+| `home_cbg` | `HOME_GEO10` from `00_residents_detection` |
+| `in_cohort` | 1 if in `FL_ALLDAY_COHORT` |
+| `evacuee` | NULL if not in cohort; 1 if a departure was detected; else 0 |
+| `departure_phase` | 1 / 2 / 3 |
+| `departure_date` | first day of the departure streak |
+| `departure_streak_end_date`, `departure_streak_length` | departure streak details |
+| `return_date` | first day of the return streak |
+| `returned_by_end` | NULL for non-evacuees; 1 if returned by `OBS_END`, else 0 (right-censored) |
+| `days_away` | `return_date - departure_date` |
+| `destination_cbg`, `destination_block_group_id` | destination as GEO10 and as the raw Cuebiq ID |
+| `destination_n_nights`, `destination_night_share` | destination QC |
 
-**`06_evacuation_distance.sql`** — One row per candidate combining departure, return, home, and destination. `evacuation_distance_km` = `ST_DISTANCE(home, destination)` / 1000, or NULL when no destination was found. Return fields are NULL when no return was observed.
+Aggregation to CBG and any home-to-destination distance are done outside Snowflake.
 
 ## Parameters used
 
 | Parameter | Value | Script |
 |---|---|---|
-| `EVAC_START`, `EVAC_END` | 20220923, 20220930 | 01 |
-| `PERSISTENCE_CHECK_END` | 20220929 | 01 |
-| `MAX_GAP_DAYS_TO_BRIDGE` | 2 | 01, 04 |
-| `MIN_CONSECUTIVE_UNFAMILIAR_DAYS` | 2 | 03 |
-| `FL_HOME_LAT_MIN/MAX`, `FL_HOME_LNG_MIN/MAX` | 24/31, -88/-79 | 03 |
-| `RETURN_START`, `RETURN_END` | 20221001, 20221023 | 04, 05 |
-| `MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN` | 2 | 04 |
-| `BASELINE_START`, `BASELINE_END` | 20220902, 20220922 | 02 |
-| `NIGHT_START_HOUR`, `NIGHT_END_HOUR` | 21, 7 | 02, 05 |
-| `HOME_LOCATION_RADIUS_KM` | 3 | 02, 05 |
-| `MIN_CONSECUTIVE_NIGHTS_AT_DESTINATION` | 2 | 05 |
+| `PHASE1_START`, `PHASE2_START`, `PHASE3_START`, `DEPARTURE_END` | 20220923, 20220928, 20221001, 20221007 | 01, 02 |
+| `OBS_END` | 20221023 | 01, 04 |
+| `MIN_CONSECUTIVE_UNFAMILIAR_DAYS` | 2 | 02 |
+| `MIN_CONSECUTIVE_FAMILIAR_DAYS_RETURN` | 2 | 03 |
+| `MAX_GAP_DAYS_TO_BRIDGE` | 2 | 02, 03 |
+| `NIGHT_START_HOUR`, `NIGHT_END_HOUR` | 21, 7 | 04 |
 
-See `../../PARAMETER_LOG.md` for why `PERSISTENCE_CHECK_END`, the streak thresholds, and the Florida gate were set this way.
+## Known limitations
+
+- **Daily resolution.** Departures on 9/28 are assigned to phase 2, even though some of them left before landfall later that day.
+- **Departures before 9/23.** A user who left before 9/23 gets `departure_date` = 9/23.
+- **Weekend in phase 3.** 10/1–10/2 is a weekend, so with a 2-day minimum some phase-3 departures may be ordinary weekend trips. Consider a sensitivity run with a 3-day minimum for phase 3.
+- **No home-location gate.** `main_v5` excluded candidates whose nighttime home was outside Florida (~0.9% of candidates). `main_v6` has no such gate, so devices whose `HOME_GEO10` is in the target area while they actually live elsewhere can appear as evacuees. Their `destination_cbg` will often be out of state.
+
+## QC queries
+
+```sql
+-- Departures and returns by phase
+SELECT departure_phase, COUNT(*) AS n, AVG(returned_by_end) AS share_returned,
+       MEDIAN(days_away) AS median_days_away
+FROM DEDICATED.HOUPU.FL_EVAC_INDIVIDUAL
+WHERE evacuee = 1
+GROUP BY departure_phase ORDER BY departure_phase;
+
+-- Destination CBG conversion failures and destination == home
+SELECT COUNT_IF(destination_cbg IS NULL AND destination_block_group_id IS NOT NULL) AS n_unconverted,
+       COUNT_IF(destination_block_group_id IS NULL) AS n_no_destination,
+       COUNT_IF(destination_cbg = home_cbg) AS n_destination_is_home_cbg
+FROM DEDICATED.HOUPU.FL_EVAC_INDIVIDUAL
+WHERE evacuee = 1;
+```
